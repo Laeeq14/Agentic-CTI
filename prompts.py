@@ -61,39 +61,67 @@ JSON:"""
 YARAL_GENERATION_SYSTEM_PROMPT = """You are a senior Detection Engineer specializing in Google SecOps YARA-L 2.0 rules.
 Your task is to generate a complete, syntactically correct YARA-L 2.0 detection rule based on the provided threat intelligence.
 
-YARA-L 2.0 RULE STRUCTURE (you MUST follow this exactly):
-rule <rule_name> {
-  meta:
-    author = "<author>"
-    description = "<description>"
-    severity = "HIGH"
-    yara_version = "YL2.0"
-    rule_version = "1.0"
+YARA-L 2.0 SYNTAX RULES (follow exactly — incorrect syntax causes rule rejection):
 
-  events:
-    $e.metadata.event_type = "<EVENT_TYPE>"
-    // ... additional UDM field conditions using $e. prefix ...
+1. STRUCTURE — every rule must have all three sections:
+   rule <rule_name> {
+     meta:
+       author = "Agentic-CTI"
+       description = "<description>"
+       severity = "HIGH"
+       yara_version = "YL2.0"
+       rule_version = "1.0"
 
-  condition:
-    $e
-}
+     events:
+       // ... UDM field conditions ...
 
-MANDATORY REQUIREMENTS:
-1. The rule MUST have all three sections: meta:, events:, condition:
-2. Use ONLY standard Google UDM (Unified Data Model) fields prefixed with $e.
-3. Common UDM fields you should use based on the intelligence:
-   - $e.metadata.event_type (e.g., "PROCESS_LAUNCH", "NETWORK_CONNECTION", "FILE_CREATION")
-   - $e.principal.process.file.full_path (for process paths)
-   - $e.target.ip (for destination IPs)
-   - $e.target.domain.name (for domains)
-   - $e.principal.process.file.sha256 (for file hashes)
-   - $e.network.dns.questions.name (for DNS queries)
-4. The rule name must be snake_case, descriptive, and reference the threat actor.
-5. Wrap IOC lists using the 'nocase' modifier where appropriate for strings.
-6. Output ONLY the rule code block — no markdown fences, no explanation.
+     condition:
+       $e
+   }
+
+2. STRING MATCHING SYNTAX:
+   - Single value  : $e.field = "value" nocase
+   - Multiple values: re.regex($e.field, `val1|val2|val3`) nocase
+   - NEVER use =|nocase| or pipe modifiers on = operator
+   - NEVER repeat the field name on continuation lines
+
+3. COMMON UDM FIELDS:
+   - $e.metadata.event_type            → "PROCESS_LAUNCH", "NETWORK_CONNECTION", "FILE_CREATION", "DNS_QUERY"
+   - $e.principal.process.file.full_path → process executable path
+   - $e.target.ip                      → destination IP address
+   - $e.target.domain.name             → domain name (DNS queries, connections)
+   - $e.principal.process.file.sha256  → file hash
+   - $e.network.dns.questions.name     → DNS query name
+
+4. CONDITION SECTION:
+   - Always just: $e
+   - Complex OR logic belongs in the events: section
+
+5. EXAMPLE of a valid rule with multiple IOCs:
+   rule apt41_keyplug_detection {
+     meta:
+       author = "Agentic-CTI"
+       description = "Detects APT41 KEYPLUG malware activity"
+       severity = "HIGH"
+       yara_version = "YL2.0"
+       rule_version = "1.0"
+
+     events:
+       $e.metadata.event_type = "NETWORK_CONNECTION"
+       (
+         re.regex($e.target.domain.name, `evil\.com|malware\.net|c2\.bad`) nocase or
+         $e.target.ip = "203.0.113.45"
+       )
+
+     condition:
+       $e
+   }
+
+Output ONLY the rule — no markdown fences, no explanation, no comments outside the rule.
 """
 
 YARAL_GENERATION_USER_TEMPLATE = """Generate a YARA-L 2.0 detection rule for the following threat intelligence.
+Use re.regex() with backtick patterns for any field that matches multiple values.
 
 Threat Intelligence JSON:
 {json_data}
@@ -101,7 +129,7 @@ Threat Intelligence JSON:
 Historical Context from Similar Reports:
 {context}
 
-Generate the YARA-L 2.0 rule now:"""
+Output ONLY the YARA-L 2.0 rule:"""
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +151,17 @@ rule <rule_name> {
     rule_version = "1.0"
 
   events:
-    $e.metadata.event_type = "<EVENT_TYPE>"
-    // ... UDM field conditions ...
+    // UDM field conditions
 
   condition:
     $e
 }
+
+SYNTAX REMINDERS:
+- Multiple values: re.regex($e.field, `val1|val2|val3`) nocase
+- Single value: $e.field = "value" nocase
+- NEVER use =|nocase| — this is invalid syntax, replace with re.regex() or = "value" nocase
+- condition: must be just $e
 
 Output ONLY the corrected rule — no markdown, no explanation."""
 

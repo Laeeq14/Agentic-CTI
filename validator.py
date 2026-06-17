@@ -177,6 +177,50 @@ def validate_yaral_rule(rule_text: str) -> Tuple[bool, str]:
             )
 
     # ------------------------------------------------------------------
+    # Check 7: Detect reversed 'nocase = "value"' — must be '= "value" nocase'
+    # ------------------------------------------------------------------
+    reversed_nocase = re.search(r"\bnocase\s*=\s*[\"']", rule_text, re.IGNORECASE)
+    if reversed_nocase:
+        errors.append(
+            "Invalid syntax: 'nocase' must come AFTER the value, not before '='. "
+            "Wrong:   $e.field nocase = \"value\" "
+            "Correct: $e.field = \"value\" nocase"
+        )
+
+    # ------------------------------------------------------------------
+    # Check 8: Detect invalid =|nocase| pipe-modifier syntax
+    # ------------------------------------------------------------------
+    pipe_nocase = re.search(r"=\s*\|nocase\|", rule_text, re.IGNORECASE)
+    if pipe_nocase:
+        errors.append(
+            "Invalid syntax: '=|nocase|' is not valid YARA-L 2.0. "
+            "For a single value use: $e.field = \"value\" nocase  "
+            "For multiple values use: re.regex($e.field, `val1|val2`) nocase"
+        )
+
+    # ------------------------------------------------------------------
+    # Check 9: Condition section must be a simple variable reference
+    # ------------------------------------------------------------------
+    if condition_match:
+        cond_text = condition_match.group(1).strip()
+        # Strip comments
+        cond_text_clean = re.sub(r"//.*$", "", cond_text, flags=re.MULTILINE).strip()
+        # Valid condition: just $varname, optionally with 'and' between multiple vars
+        # e.g. "$e" or "$e and $e2"
+        complex_condition = re.search(
+            r"(\.metadata\.|\.target\.|\.principal\.|nocase|=|and\s+\(|or\s+\()",
+            cond_text_clean,
+            re.IGNORECASE,
+        )
+        if complex_condition:
+            errors.append(
+                "The 'condition:' section contains complex logic (field comparisons, OR/AND with parentheses). "
+                "In YARA-L 2.0, the condition MUST be a simple event variable reference only. "
+                "Move ALL matching logic to the 'events:' section. "
+                "Correct condition: 'condition:\\n    $e'"
+            )
+
+    # ------------------------------------------------------------------
     # Final result
     # ------------------------------------------------------------------
     if errors:

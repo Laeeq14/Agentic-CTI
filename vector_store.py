@@ -9,6 +9,7 @@ Embeddings are generated locally via sentence-transformers (all-MiniLM-L6-v2),
 requiring no external API key.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -167,12 +168,19 @@ def add_report(report: "Any", source_text: str = "") -> str:
     """
     Embed and upsert a ThreatIntelReport into the Qdrant collection.
 
+    Uses a deterministic point ID derived from the SOURCE DOCUMENT hash (not the
+    extraction summary) so that re-running the same report does not create
+    duplicate entries — even when the LLM produces slightly different extractions
+    across runs (non-determinism). Qdrant's upsert semantics overwrite an existing
+    point when the ID already exists.
+
     Args:
         report: A ThreatIntelReport Pydantic model instance.
-        source_text: Optional raw source text to store as payload metadata.
+        source_text: Raw source text of the original report. Used as the
+                     primary deduplication key when provided.
 
     Returns:
-        The UUID string of the inserted point.
+        The UUID string of the upserted point.
     """
     initialize_collection()
     encoder = _get_encoder()
@@ -181,7 +189,12 @@ def add_report(report: "Any", source_text: str = "") -> str:
     summary = _build_report_summary(report)
     vector = encoder.encode(summary, normalize_embeddings=True).tolist()
 
-    point_id = str(uuid.uuid4())
+    # Dedup key: prefer source document hash (stable across LLM runs),
+    # fall back to extraction summary hash if no source text was provided.
+    dedup_input = source_text.strip() if source_text and source_text.strip() else summary
+    content_hash = hashlib.sha256(dedup_input.encode("utf-8")).hexdigest()
+    point_id = str(uuid.UUID(content_hash[:32]))
+
     payload: dict[str, Any] = {
         "threat_actor": report.threat_actor,
         "malware_families": report.malware_families,
@@ -195,7 +208,9 @@ def add_report(report: "Any", source_text: str = "") -> str:
         collection_name=COLLECTION_NAME,
         points=[PointStruct(id=point_id, vector=vector, payload=payload)],
     )
-    logger.info("Upserted report for threat actor '%s' (id=%s)", report.threat_actor, point_id)
+    logger.info(
+        "Upserted report for threat actor '%s' (id=%s)", report.threat_actor, point_id
+    )
     return point_id
 
 
