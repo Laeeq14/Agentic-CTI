@@ -1,0 +1,53 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Qdrant persistent storage (both default path and custom path)
+qdrant_storage/
+qdrant_local_db/
+
+# Sentence-transformers / HuggingFace model cache
+.cache/
+
+# Streamlit
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ── Watch inbox / results (mounted as Docker volumes; keep .gitkeep) ─────────
+watch_inbox/*
+!watch_inbox/.gitkeep
+watch_results/*
+!watch_results/.gitkeep
+
+# ── Eval framework results (auto-generated JSON runs) ────────────────────────
+tests/eval/results/*.json
+
+# ── One-off utility scripts ───────────────────────────────────────────────────
+strip_emoji.py

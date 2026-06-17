@@ -1,0 +1,47 @@
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Environment secrets ───────────────────────────────────────────────────────
+.env
+
+# ── Local Qdrant storage (managed by Docker volume in production) ─────────────
+qdrant_local_db/
+qdrant_storage/
+
+# ── Model cache (managed by Docker volume in production) ─────────────────────
+.cache/
+
+# ── Streamlit ─────────────────────────────────────────────────────────────────
+.streamlit/
+
+# ── Watch directories (mounted as volumes) ────────────────────────────────────
+watch_inbox/
+watch_results/
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+*.orig
+
+# ── Test artifacts ────────────────────────────────────────────────────────────
+tests/eval/results/
+.pytest_cache/

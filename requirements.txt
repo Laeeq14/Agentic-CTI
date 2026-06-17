@@ -1,0 +1,28 @@
+# LangChain / LangGraph ecosystem
+langchain>=0.2.0
+langchain-groq>=0.1.6
+langchain-core>=0.2.0
+langgraph>=0.1.19
+
+# Data validation
+pydantic>=2.7.0
+
+# Vector store
+qdrant-client>=1.9.1
+
+# Embeddings (local, no API key required)
+sentence-transformers>=3.0.0
+
+# Frontend
+streamlit>=1.35.0
+
+# Utilities
+python-dotenv>=1.0.1
+
+# ── Feature: Async file watcher (src/ingestion/watcher.py) ──────────────────
+watchdog>=4.0.0          # filesystem event monitoring
+aiofiles>=23.2.0         # async file I/O helpers
+
+# ── Feature: PDF ingestion support ───────────────────────────────────────────
+pypdf>=4.2.0             # extract text from PDF threat advisories
+cryptography>=3.1        # AES decryption for owner-locked PDFs (required by pypdf)
