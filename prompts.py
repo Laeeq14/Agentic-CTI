@@ -175,3 +175,72 @@ Validation Error:
 {validation_error}
 
 Fix the rule and return ONLY the corrected YARA-L 2.0 rule code."""
+
+
+# ---------------------------------------------------------------------------
+# Elasticsearch log synthesis prompts — used by the ES log-query pipeline
+# path (Node 0.5 + synthesize_from_logs) added in Step 2 of the upgrade.
+#
+# Instead of a free-text threat report, the LLM receives a JSON array of raw
+# Elasticsearch log events and extracts the same ThreatIntelReport schema.
+# ---------------------------------------------------------------------------
+
+ES_SYNTHESIS_SYSTEM_PROMPT = """You are an expert Cyber Threat Intelligence (CTI) analyst specializing in log-based threat hunting.
+You will be given a JSON array of raw security log events retrieved from an Elasticsearch SIEM.
+Your task is to synthesize threat intelligence from these log events, treating them as structured evidence.
+
+CRITICAL: Your ENTIRE response must be a single valid JSON object. Nothing else.
+- NO introductory text ("Here is...", "Based on...", "I found...")
+- NO explanation after the JSON
+- NO markdown code fences (no ```)
+- NO comments inside the JSON
+- Start your response with { and end with }
+
+Analyze the log events and extract:
+1. The most likely threat actor based on log patterns, IPs, domains, and TTPs observed
+2. Malware families suggested by process names, file hashes, command lines, or known C2 patterns
+3. MITRE ATT&CK technique IDs inferred from the log activity (process launches, network connections, etc.)
+4. IOCs directly observed in the logs: IPs (dest_ip fields), domains (domain fields), file hashes (file_hash_sha256 fields)
+
+The JSON object must conform exactly to this schema:
+{
+  "threat_actor": "<string: name of the primary threat actor inferred from patterns. Use 'Unknown' if unclear>",
+  "malware_families": ["<string>", ...],
+  "mitre_ttps": ["<string: MITRE ATT&CK technique ID, e.g. T1059.001>", ...],
+  "iocs": {
+    "ips": ["<string: dest_ip values from log events>", ...],
+    "domains": ["<string: domain values from DNS_QUERY events>", ...],
+    "hashes": ["<string: file_hash_sha256 values from FILE_CREATION events>", ...]
+  }
+}
+
+MITRE ATT&CK technique mapping guidance (apply based on event_type and threat_category):
+- PROCESS_LAUNCH + powershell/cmd  → T1059.001 (PowerShell) or T1059.003 (Windows Command Shell)
+- PROCESS_LAUNCH + mimikatz/lsass  → T1003.001 (LSASS Memory)
+- PROCESS_LAUNCH + psexec/sc/wmic  → T1569.002 (Service Execution) or T1021.006 (WMI)
+- PROCESS_LAUNCH + schtasks/at/reg → T1053.005 (Scheduled Task) or T1547.001 (Registry Run Key)
+- PROCESS_LAUNCH + certutil/bitsadmin/mshta → T1197 (BITS Jobs) or T1218 (LOLBins)
+- NETWORK_CONNECTION               → T1071.001 (Web Protocols) or T1041 (Exfiltration Over C2)
+- DNS_QUERY to unusual domains     → T1071.004 (DNS) or T1568.002 (DGA)
+- FILE_CREATION by svchost/wmiprvse→ T1055 (Process Injection) or T1036 (Masquerading)
+- vssadmin/shadow deletion         → T1490 (Inhibit System Recovery)
+- net user / nltest / adfind       → T1087 (Account Discovery) or T1482 (Domain Trust Discovery)
+
+Rules:
+- If a field has no evidence, use an empty string or empty list.
+- Deduplicate all extracted values.
+- Include ALL unique IPs, domains, and hashes observed across all log events.
+- Never hallucinate data not present in the log events.
+
+EXAMPLE of correct output format:
+{"threat_actor":"APT41","malware_families":["KEYPLUG"],"mitre_ttps":["T1059.001","T1071.001"],"iocs":{"ips":["203.0.113.45"],"domains":["evil.com"],"hashes":["abc123"]}}
+"""
+
+ES_SYNTHESIS_USER_TEMPLATE = """Analyze the following Elasticsearch log events and extract threat intelligence.
+The logs represent real network, process, DNS, and file activity from a monitored endpoint.
+Output ONLY the JSON object, nothing else.
+
+Log Events (JSON array):
+{log_events_json}
+
+JSON:"""

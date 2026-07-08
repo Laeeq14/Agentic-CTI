@@ -35,6 +35,8 @@ from prompts import (
     YARAL_CORRECTION_USER_TEMPLATE,
     YARAL_GENERATION_SYSTEM_PROMPT,
     YARAL_GENERATION_USER_TEMPLATE,
+    ES_SYNTHESIS_SYSTEM_PROMPT,
+    ES_SYNTHESIS_USER_TEMPLATE,
 )
 
 load_dotenv()
@@ -92,12 +94,25 @@ class ThreatIntelState(TypedDict):
     Shared state dictionary passed between all LangGraph nodes.
 
     Fields are populated progressively as the graph executes.
+
+    Two pipeline paths are supported:
+      - input_type == "text_report"  → scan_for_injection → extract_threat_intel → ...
+      - input_type == "log_query"    → query_elasticsearch_logs → synthesize_from_logs → ...
     """
 
-    # Input
+    # Input — shared
     raw_text: str
+    input_type: str  # "text_report" (default) or "log_query"
 
-    # Node 0 — Security scan
+    # ES log-query path inputs (only used when input_type == "log_query")
+    log_query: Optional[str]        # Lucene query string
+    log_query_index: Optional[str]  # target ES index
+    log_query_size: Optional[int]   # max log events to retrieve
+
+    # ES log-query path intermediates
+    log_events: Optional[list[dict[str, Any]]]  # raw log events from ES
+
+    # Node 0 — Security scan (text_report path only)
     security_scan: Optional[dict[str, Any]]  # ScanResult fields; None = not yet run
 
     # Extraction node output
@@ -544,6 +559,129 @@ def finalize(state: ThreatIntelState) -> ThreatIntelState:
 
 
 # ---------------------------------------------------------------------------
+# Node 0.5 (ES path): Query Elasticsearch logs
+# ---------------------------------------------------------------------------
+
+def query_elasticsearch_logs(state: ThreatIntelState) -> ThreatIntelState:
+    """
+    Node 0.5 (ES path) — Query Elasticsearch for security log events.
+
+    Runs only when input_type == "log_query". Calls the Elasticsearch client
+    with the Lucene query string from state, returning up to log_query_size
+    matching raw log events as a list of dicts stored in state["log_events"].
+
+    On failure, sets pipeline_error and routes to finalize.
+
+    Args:
+        state: Current graph state. Expects 'log_query', 'log_query_index',
+               and 'log_query_size' to be set.
+
+    Returns:
+        Updated state with 'log_events' populated, or 'pipeline_error' on failure.
+    """
+    query = state.get("log_query", "")
+    index = state.get("log_query_index") or "agentic-cti-logs"
+    size  = state.get("log_query_size") or 100
+
+    logger.info("[Node 0.5/ES] Querying Elasticsearch: index=%s, size=%d, query=%r", index, size, query)
+
+    try:
+        from api.es_client import search_logs
+        events = search_logs(query=query, index=index, size=size)
+        logger.info("[Node 0.5/ES] Retrieved %d log events.", len(events))
+        return {**state, "log_events": events}
+    except Exception as exc:
+        msg = f"Elasticsearch query failed: {type(exc).__name__}: {exc}"
+        logger.exception("[Node 0.5/ES] %s", msg)
+        return {**state, "log_events": [], "pipeline_error": msg}
+
+
+# ---------------------------------------------------------------------------
+# Node 1 (ES path): Synthesize threat intel from log events
+# ---------------------------------------------------------------------------
+
+def synthesize_from_logs(state: ThreatIntelState) -> ThreatIntelState:
+    """
+    Node 1 (ES path) — Synthesize structured threat intel from raw log events.
+
+    Feeds the raw Elasticsearch log events (stored as a JSON array) to the LLM
+    using the ES synthesis prompt. Extracts the same ThreatIntelReport schema
+    as extract_threat_intel, so the downstream RAG → YARA-L pipeline is
+    completely unchanged.
+
+    Args:
+        state: Current graph state. Expects 'log_events' to be populated.
+
+    Returns:
+        Updated state with 'extracted_report' or 'extraction_error' populated.
+    """
+    logger.info("[Node 1/ES] Synthesizing threat intel from %d log events...", len(state.get("log_events") or []))
+
+    events = state.get("log_events") or []
+    if not events:
+        msg = "No log events retrieved from Elasticsearch; cannot synthesize threat intel."
+        logger.error("[Node 1/ES] %s", msg)
+        return {**state, "extracted_report": None, "extraction_error": msg}
+
+    raw_response: Optional[str] = None
+
+    try:
+        # Truncate event list if extremely large
+        max_events = 50  # cap JSON payload to ~10k chars
+        if len(events) > max_events:
+            logger.warning("[Node 1/ES] Truncating log events from %d to %d for LLM context.", len(events), max_events)
+            events = events[:max_events]
+
+        log_events_json = json.dumps(events, indent=2)
+
+        llm = _get_llm(temperature=0.0)
+        messages = [
+            SystemMessage(content=ES_SYNTHESIS_SYSTEM_PROMPT),
+            HumanMessage(
+                content=ES_SYNTHESIS_USER_TEMPLATE.format(log_events_json=log_events_json)
+            ),
+        ]
+
+        response = llm.invoke(messages)
+        raw_response = response.content.strip()
+        logger.info("[Node 1/ES] Raw LLM response (first 500 chars): %s", raw_response[:500])
+
+        parsed = _extract_json_from_llm_response(raw_response)
+
+        # Normalize iocs field
+        if isinstance(parsed.get("iocs"), dict):
+            iocs_raw = parsed["iocs"]
+            parsed["iocs"] = {
+                "ips":     iocs_raw.get("ips", []),
+                "domains": iocs_raw.get("domains", []),
+                "hashes":  iocs_raw.get("hashes", []),
+            }
+
+        report = ThreatIntelReport(**parsed)
+        logger.info("[Node 1/ES] Synthesis successful. Threat actor: %s", report.threat_actor)
+        return {
+            **state,
+            "extracted_report": report,
+            "extraction_error": None,
+            "llm_raw_response": raw_response,
+        }
+
+    except ValueError as e:
+        msg = f"JSON parse failed (ES synthesis): {e}"
+        logger.error("[Node 1/ES] %s", msg)
+        return {**state, "extracted_report": None, "extraction_error": msg, "llm_raw_response": raw_response}
+    except ValidationError as e:
+        msg = f"Schema validation failed (ES synthesis): {e}"
+        logger.error("[Node 1/ES] %s", msg)
+        return {**state, "extracted_report": None, "extraction_error": msg, "llm_raw_response": raw_response}
+    except Exception as e:
+        msg = f"API/pipeline error (ES synthesis): {type(e).__name__}: {e}"
+        logger.exception("[Node 1/ES] %s", msg)
+        debug_info = raw_response or f"[No response — exception before API call completed]\n{e}"
+        return {**state, "extracted_report": None, "extraction_error": msg, "llm_raw_response": debug_info}
+
+
+# ---------------------------------------------------------------------------
 # Conditional routing
 # ---------------------------------------------------------------------------
 
@@ -561,6 +699,34 @@ def _route_after_validation(state: ThreatIntelState) -> str:
         logger.warning("Max retries reached; routing to finalize with error.")
         return "finalize"
     return "generate_yaral"
+
+
+def _route_entry_point(state: ThreatIntelState) -> str:
+    """
+    Router function at the graph entry point.
+
+    Dispatches to the correct first node based on input_type:
+      - "log_query"    → query_elasticsearch_logs (ES path)
+      - "text_report"  → scan_for_injection        (default text path)
+    """
+    if state.get("input_type") == "log_query":
+        logger.info("[Router] input_type=log_query → ES pipeline path.")
+        return "query_elasticsearch_logs"
+    logger.info("[Router] input_type=text_report → text pipeline path.")
+    return "scan_for_injection"
+
+
+def _route_after_es_query(state: ThreatIntelState) -> str:
+    """
+    Router function called after query_elasticsearch_logs.
+
+    Returns:
+        'synthesize_from_logs' if events were retrieved.
+        'finalize' if the ES query failed.
+    """
+    if state.get("pipeline_error"):
+        return "finalize"
+    return "synthesize_from_logs"
 
 
 def _route_after_scan(state: ThreatIntelState) -> str:
@@ -598,41 +764,65 @@ def _build_graph() -> Any:
     """
     Build and compile the LangGraph state machine.
 
-    Graph topology:
-      scan_for_injection           ← NEW: Node 0, prompt guard
-            ↓ (safe)
-      extract_threat_intel
-            ↓ (success)
-      contextualize_with_rag
-            ↓
-      generate_yaral  ←──────────────────────┐
-            ↓                                │
-      validate_yaral  ──(fail, retries left)─┘
-            ↓ (pass or retries exhausted)
-         finalize
-            ↓
-           END
+    Graph topology (two entry paths):
 
-    If the prompt guard flags the input, the pipeline routes directly from
-    scan_for_injection to finalize — no LLM calls are made.
+      [TEXT REPORT PATH]
+      entry_router ──(text_report)──► scan_for_injection (Node 0)
+                                            ↓ (safe)
+                                      extract_threat_intel (Node 1)
+                                            ↓ (success)
+                                           ┐
+      [ES LOG QUERY PATH]                  │
+      entry_router ──(log_query)──► query_elasticsearch_logs (Node 0.5)
+                                            ↓
+                                      synthesize_from_logs (Node 1.5)
+                                            ↓
+                                           ┘
+                                      contextualize_with_rag (Node 2)
+                                            ↓
+                                      generate_yaral (Node 3) ◄─────┐
+                                            ↓                       │
+                                      validate_yaral (Node 4) ─(fail)┘
+                                            ↓ (pass or exhausted)
+                                         finalize (Node 5)
+                                            ↓
+                                           END
 
     Returns:
         A compiled LangGraph CompiledGraph ready for invocation.
     """
     workflow = StateGraph(ThreatIntelState)
 
-    # Register nodes
-    workflow.add_node("scan_for_injection", scan_for_injection)  # Node 0
-    workflow.add_node("extract_threat_intel", extract_threat_intel)
-    workflow.add_node("contextualize_with_rag", contextualize_with_rag)
-    workflow.add_node("generate_yaral", generate_yaral)
-    workflow.add_node("validate_yaral", validate_yaral)
-    workflow.add_node("finalize", finalize)
+    # ── Register all nodes ──────────────────────────────────────────────────
+    # Shared entry router (virtual start node)
+    workflow.add_node("entry_router_node", lambda s: s)  # pass-through; routing done by conditional edge
 
-    # Entry point — always the prompt guard
-    workflow.set_entry_point("scan_for_injection")
+    # Text-report path
+    workflow.add_node("scan_for_injection", scan_for_injection)         # Node 0
+    workflow.add_node("extract_threat_intel", extract_threat_intel)     # Node 1
 
-    # Conditional edge after scan: safe -> extract, flagged -> finalize
+    # ES log-query path
+    workflow.add_node("query_elasticsearch_logs", query_elasticsearch_logs)  # Node 0.5
+    workflow.add_node("synthesize_from_logs", synthesize_from_logs)          # Node 1.5
+
+    # Shared downstream pipeline
+    workflow.add_node("contextualize_with_rag", contextualize_with_rag)  # Node 2
+    workflow.add_node("generate_yaral", generate_yaral)                  # Node 3
+    workflow.add_node("validate_yaral", validate_yaral)                  # Node 4
+    workflow.add_node("finalize", finalize)                              # Node 5
+
+    # ── Entry point: dispatch to correct first node based on input_type ─────
+    workflow.set_entry_point("entry_router_node")
+    workflow.add_conditional_edges(
+        "entry_router_node",
+        _route_entry_point,
+        {
+            "scan_for_injection":        "scan_for_injection",
+            "query_elasticsearch_logs":  "query_elasticsearch_logs",
+        },
+    )
+
+    # ── Text-report path edges ───────────────────────────────────────────────
     workflow.add_conditional_edges(
         "scan_for_injection",
         _route_after_scan,
@@ -641,8 +831,6 @@ def _build_graph() -> Any:
             "finalize": "finalize",
         },
     )
-
-    # Conditional edge after extraction (may short-circuit to finalize on error)
     workflow.add_conditional_edges(
         "extract_threat_intel",
         _route_after_extraction,
@@ -652,11 +840,27 @@ def _build_graph() -> Any:
         },
     )
 
-    # Linear edges through RAG and generation
+    # ── ES log-query path edges ──────────────────────────────────────────────
+    workflow.add_conditional_edges(
+        "query_elasticsearch_logs",
+        _route_after_es_query,
+        {
+            "synthesize_from_logs": "synthesize_from_logs",
+            "finalize": "finalize",
+        },
+    )
+    workflow.add_conditional_edges(
+        "synthesize_from_logs",
+        _route_after_extraction,  # same router — checks extraction_error
+        {
+            "contextualize_with_rag": "contextualize_with_rag",
+            "finalize": "finalize",
+        },
+    )
+
+    # ── Shared downstream edges ──────────────────────────────────────────────
     workflow.add_edge("contextualize_with_rag", "generate_yaral")
     workflow.add_edge("generate_yaral", "validate_yaral")
-
-    # Conditional retry loop after validation
     workflow.add_conditional_edges(
         "validate_yaral",
         _route_after_validation,
@@ -665,8 +869,6 @@ def _build_graph() -> Any:
             "finalize": "finalize",
         },
     )
-
-    # Finalize always terminates
     workflow.add_edge("finalize", END)
 
     return workflow.compile()
@@ -717,6 +919,13 @@ def run_pipeline(text: str) -> ThreatIntelState:
 
     initial_state: ThreatIntelState = {
         "raw_text": text,
+        "input_type": "text_report",
+        # ES path fields (not used in text_report path)
+        "log_query": None,
+        "log_query_index": None,
+        "log_query_size": None,
+        "log_events": None,
+        # Pipeline fields
         "security_scan": None,
         "extracted_report": None,
         "extraction_error": None,
@@ -729,9 +938,62 @@ def run_pipeline(text: str) -> ThreatIntelState:
         "pipeline_error": None,
     }
 
-    logger.info("Starting Agentic-CTI pipeline...")
+    logger.info("Starting Agentic-CTI text-report pipeline...")
     result: ThreatIntelState = _graph.invoke(initial_state)
     logger.info("Pipeline finished.")
+    return result
+
+
+def run_pipeline_from_logs(
+    query: str,
+    index: str = "agentic-cti-logs",
+    size: int = 100,
+) -> ThreatIntelState:
+    """
+    Execute the Agentic-CTI pipeline starting from an Elasticsearch log query.
+
+    This is the new log-query entry point (Step 2 of the upgrade plan).
+    Instead of processing a text report, the pipeline:
+      1. Queries Elasticsearch with the given Lucene query string.
+      2. Synthesizes threat intelligence from the raw log events.
+      3. Feeds the extracted intel through the existing RAG → YARA-L pipeline.
+
+    Args:
+        query: Lucene query string (e.g. "event_type:NETWORK_CONNECTION AND dest_ip:1.2.3.4").
+        index: Elasticsearch index to query. Defaults to 'agentic-cti-logs'.
+        size:  Maximum number of log events to retrieve. Defaults to 100.
+
+    Returns:
+        The final ThreatIntelState dict with all populated fields.
+
+    Raises:
+        ValueError: If the query is empty or whitespace-only.
+    """
+    if not query or not query.strip():
+        raise ValueError("Log query cannot be empty.")
+
+    initial_state: ThreatIntelState = {
+        "raw_text": f"[ES log query: {query}]",  # summary for RAG embedding
+        "input_type": "log_query",
+        "log_query": query,
+        "log_query_index": index,
+        "log_query_size": size,
+        "log_events": None,
+        "security_scan": None,
+        "extracted_report": None,
+        "extraction_error": None,
+        "llm_raw_response": None,
+        "rag_context": None,
+        "yaral_draft": None,
+        "yaral_validation_error": None,
+        "retry_count": 0,
+        "final_yaral_rule": None,
+        "pipeline_error": None,
+    }
+
+    logger.info("Starting Agentic-CTI ES log-query pipeline... query=%r, index=%s, size=%d", query, index, size)
+    result: ThreatIntelState = _graph.invoke(initial_state)
+    logger.info("ES pipeline finished.")
     return result
 
 

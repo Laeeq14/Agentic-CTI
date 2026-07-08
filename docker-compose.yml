@@ -4,13 +4,16 @@ version: "3.9"
 #  Agentic-CTI Docker Compose Stack
 #
 #  Services:
-#    qdrant  — Vector database (official image, persistent volume)
-#    app     — Streamlit + LangGraph pipeline
+#    qdrant            — Vector database (persistent volume)
+#    elasticsearch     — Security log store (single-node, no auth for dev)
+#    fastapi-backend   — Programmatic API wrapping the LangGraph pipeline
+#    app               — Streamlit SOC dashboard (calls FastAPI)
 #
 #  Usage:
-#    docker-compose up --build          # first run
+#    docker-compose up --build          # first run (builds images)
 #    docker-compose up -d               # detached mode
 #    docker-compose down -v             # tear down + remove volumes
+#    docker-compose logs -f fastapi-backend   # tail API logs
 # ═══════════════════════════════════════════════════════════
 
 services:
@@ -32,7 +35,61 @@ services:
       retries: 5
       start_period: 10s
 
-  # ── Agentic-CTI Application ──────────────────────────────
+  # ── Elasticsearch 8.x (single-node, security disabled for local dev) ────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: agentic_cti_es
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+
+  # ── FastAPI Backend — programmatic API wrapping the LangGraph pipeline ───────
+  fastapi-backend:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    container_name: agentic_cti_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      TRANSFORMERS_CACHE: /app/.cache/transformers
+      HF_HOME: /app/.cache/huggingface
+    volumes:
+      - model_cache:/app/.cache
+      - ./watch_inbox:/app/watch_inbox
+      - ./watch_results:/app/watch_results
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ── Streamlit SOC Dashboard ──────────────────────────────────────────────────
   app:
     build:
       context: .
@@ -44,19 +101,16 @@ services:
     env_file:
       - .env
     environment:
-      # Override local Qdrant path — connect to the Qdrant service instead
       QDRANT_URL: http://qdrant:6333
-      # Sentence-transformers cache inside container
+      FASTAPI_URL: http://fastapi-backend:8000
       TRANSFORMERS_CACHE: /app/.cache/transformers
       HF_HOME: /app/.cache/huggingface
     volumes:
-      # Persist watch directories across container restarts
       - ./watch_inbox:/app/watch_inbox
       - ./watch_results:/app/watch_results
-      # Mount model cache so it isn't re-downloaded on every restart
       - model_cache:/app/.cache
     depends_on:
-      qdrant:
+      fastapi-backend:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
@@ -67,6 +121,8 @@ services:
 
 volumes:
   qdrant_data:
+    driver: local
+  es_data:
     driver: local
   model_cache:
     driver: local
