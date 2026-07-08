@@ -32,6 +32,29 @@ The JSON object must conform exactly to this schema:
   }
 }
 
+BEHAVIORAL INFERENCE PROTOCOL:
+Do NOT rely only on explicit MITRE ATT&CK ID mentions. You must actively infer TTPs from
+narrative descriptions of attacker behavior. Scan the text specifically for these tactical
+categories and map them to the appropriate MITRE IDs:
+- Initial Access       : spearphishing links/attachments (T1566.001/T1566.002), drive-by (T1189),
+                         supply chain (T1195), valid accounts (T1078)
+- Execution            : PowerShell (T1059.001), scripting (T1059.005), malicious macros (T1059.005),
+                         scheduled tasks (T1053.005), WMI (T1047)
+- Persistence          : registry run keys (T1547.001), startup folder LNK (T1547.001),
+                         boot/logon scripts (T1037)
+- Privilege Escalation : process injection (T1055), exploitation (T1068)
+- Defense Evasion      : obfuscation/encoding (T1027), masquerading (T1036), packing (T1027.002)
+- Credential Access    : keylogging (T1056.001), LSASS dumping (T1003.001), credential phishing (T1598)
+- Discovery            : file/directory enumeration (T1083), system info discovery (T1082)
+- Collection           : audio capture (T1123), screen capture (T1113), data from local system (T1005),
+                         clipboard data (T1115), data staged in archives (T1560.001)
+- C2                   : web protocols (T1071.001), DNS (T1071.004), custom encryption (T1573),
+                         data encoding (T1132)
+- Exfiltration         : exfil over C2 (T1041), exfil over web (T1567)
+- Impact               : data destruction (T1485), inhibit recovery (T1490)
+
+Extract ALL implicitly described behaviors as formal TTPs — do not wait for explicit ID citations.
+
 Rules:
 - If a field has no evidence in the text, use an empty string ("") for strings or an empty list ([]) for arrays.
 - For threat_actor: if multiple actors are mentioned, use the primary one. For vendor/industry reports, use the vendor or company name.
@@ -60,6 +83,16 @@ JSON:"""
 
 YARAL_GENERATION_SYSTEM_PROMPT = """You are a senior Detection Engineer specializing in Google SecOps YARA-L 2.0 rules.
 Your task is to generate a complete, syntactically correct YARA-L 2.0 detection rule based on the provided threat intelligence.
+
+CRITICAL INSTRUCTION — EXHAUSTION CLAUSE:
+You are a deterministic rule-generation engine, not a summarizer.
+You MUST iterate through the ENTIRE provided JSON context and include EVERY SINGLE domain,
+IP address, and file hash in your regex conditions.
+- DO NOT truncate lists.
+- DO NOT use "..." or "and N more" or any summarization.
+- DO NOT omit any IOC for any reason.
+- Dropping even a single IOC from the source JSON is considered a CRITICAL COMPILATION FAILURE.
+Generate the complete, exhaustive YARA-L rule containing all IOCs.
 
 YARA-L 2.0 SYNTAX RULES (follow exactly — incorrect syntax causes rule rejection):
 

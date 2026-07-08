@@ -31,11 +31,10 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 from agent import ThreatIntelReport, run_pipeline
 
-# Mirror of agent.MAX_INPUT_CHARS — max chars sent to the LLM to avoid
-# context-window overruns on large PDFs (25k chars ≈ 6k tokens).
-# Increased from 12k to cover research/policy reports where IOCs appear
-# deeper in the document (e.g. Facebook Surveillance-for-Hire report).
-MAX_INPUT_CHARS = 25_000
+# Mirror of agent.MAX_INPUT_CHARS — max chars sent to the LLM.
+# 100k chars ≈ 25k tokens, well within llama-3.3-70b's 128k token window.
+# See agent.py for full context math and the map-reduce backlog note.
+MAX_INPUT_CHARS = 100_000
 import vector_store as vs
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer

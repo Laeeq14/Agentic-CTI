@@ -44,12 +44,20 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 3
 
-# Maximum characters of raw text sent to the LLM.
-# Groq's llama-3.3-70b supports ~128k tokens; we cap at 25k chars (~6k tokens)
-# to leave ample room for system prompts and structured JSON output.
-# Research/policy PDFs (e.g. Meta surveillance reports) often have IOCs
-# deeper in the document, so 25k covers more ground than the initial 12k.
-MAX_INPUT_CHARS = 25_000
+# Maximum characters of raw text sent to the LLM (extraction step only).
+#
+# Context math:
+#   Groq llama-3.3-70b context window ≈ 128k tokens ≈ 500k characters
+#   1 token ≈ 4 characters
+#   100k chars ≈ 25k tokens — leaves ~100k tokens for system prompt + JSON output
+#
+# 100k covers the vast majority of real-world threat advisories, including
+# full-length vendor reports with IOC appendices (e.g. 45k-char Arid Viper PDF).
+#
+# For documents beyond 100k chars, the correct solution is a Map-Reduce
+# chunking approach (split → extract per chunk → merge/dedupe) rather than
+# raising this limit further. Add to backlog: LangGraph Map-Reduce for PDFs.
+MAX_INPUT_CHARS = 100_000
 
 
 # ---------------------------------------------------------------------------
