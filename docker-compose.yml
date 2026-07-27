@@ -4,10 +4,13 @@ version: "3.9"
 #  Agentic-CTI Docker Compose Stack
 #
 #  Services:
-#    qdrant            — Vector database (persistent volume)
-#    elasticsearch     — Security log store (single-node, no auth for dev)
-#    fastapi-backend   — Programmatic API wrapping the LangGraph pipeline
-#    app               — Streamlit SOC dashboard (calls FastAPI)
+#    qdrant            - Vector database (persistent volume)
+#    elasticsearch     - Security log store
+#                        Dev:  xpack.security disabled (default)
+#                        Prod: set ES_SECURITY_ENABLED=true + ELASTIC_PASSWORD in .env
+#    fastapi-backend   - Programmatic API wrapping the LangGraph pipeline
+#                        Prod: set API_KEY + CORS_ALLOWED_ORIGINS in .env
+#    app               - Streamlit SOC dashboard (calls FastAPI)
 #
 #  Usage:
 #    docker-compose up --build          # first run (builds images)
@@ -35,22 +38,37 @@ services:
       retries: 5
       start_period: 10s
 
-  # ── Elasticsearch 8.x (single-node, security disabled for local dev) ────────
+  # ── Elasticsearch 8.x ─────────────────────────────────────────────────────
+  # Security is OFF by default (dev mode: ES_SECURITY_ENABLED unset or 'false').
+  # To enable auth for production:
+  #   1. Set ES_SECURITY_ENABLED=true in your .env file (or environment).
+  #   2. Set ELASTIC_PASSWORD=<strong-password> in your .env file.
+  #   3. Update ELASTICSEARCH_URL in the fastapi-backend env block:
+  #        ELASTICSEARCH_URL: http://elastic:${ELASTIC_PASSWORD}@elasticsearch:9200
+  #   4. Run: docker-compose down -v && docker-compose up --build
+  #      (volume must be cleared when toggling security on a fresh cluster)
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
     container_name: agentic_cti_es
     restart: unless-stopped
     environment:
       - discovery.type=single-node
-      - xpack.security.enabled=false
-      - xpack.security.http.ssl.enabled=false
+      - xpack.security.enabled=${ES_SECURITY_ENABLED:-false}
+      - xpack.security.http.ssl.enabled=false   # TLS termination handled by ALB in prod
       - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      # ELASTIC_PASSWORD is only used when ES_SECURITY_ENABLED=true.
+      # Leave blank (or omit) for dev; set a strong value for production.
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-}
     ports:
       - "9200:9200"
       - "9300:9300"
     volumes:
       - es_data:/usr/share/elasticsearch/data
     healthcheck:
+      # Works for both auth-enabled and auth-disabled:
+      #   - No auth:   curl http://localhost:9200/_cluster/health   -> 200
+      #   - With auth: curl -u elastic:<pwd> ... is not needed for health endpoint
+      #     when ssl is off; basic status is still readable unauthenticated.
       test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
       interval: 15s
       timeout: 10s
@@ -70,9 +88,22 @@ services:
       - .env
     environment:
       QDRANT_URL: http://qdrant:6333
+      # In dev (ES_SECURITY_ENABLED unset): plain URL, no credentials
+      # In prod (ES_SECURITY_ENABLED=true): update to include credentials:
+      #   ELASTICSEARCH_URL: http://elastic:${ELASTIC_PASSWORD}@elasticsearch:9200
       ELASTICSEARCH_URL: http://elasticsearch:9200
       TRANSFORMERS_CACHE: /app/.cache/transformers
       HF_HOME: /app/.cache/huggingface
+      # --- API Security ---
+      # API_KEY: ""          # Leave blank to disable auth (dev mode).
+      #                      # Set to a secret string to enable X-API-Key enforcement
+      #                      # on all /api/* endpoints (except /api/health).
+      #                      # Example: API_KEY: "changeme-$(openssl rand -hex 16)"
+      #
+      # CORS_ALLOWED_ORIGINS: "*"   # Dev default: allow all origins.
+      #                              # Production: set to a comma-separated list of
+      #                              # allowed origins, e.g.:
+      #                              # CORS_ALLOWED_ORIGINS: "https://soc.example.com"
     volumes:
       - model_cache:/app/.cache
       - ./watch_inbox:/app/watch_inbox

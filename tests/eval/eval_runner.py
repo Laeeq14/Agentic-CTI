@@ -75,6 +75,13 @@ except ImportError:
 
 from src.security.prompt_guard import scan as guard_scan
 
+try:
+    from tests.eval.fp_evaluator import run_fp_check
+    _FP_EVALUATOR_AVAILABLE = True
+except Exception as _fp_err:
+    _FP_EVALUATOR_AVAILABLE = False
+    logging.getLogger(__name__).warning("FP evaluator unavailable: %s", _fp_err)
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -245,7 +252,18 @@ def _evaluate_fixture(
         "actor_match"         : None,   # bool
         # --- rule generation ---
         "yaral_first_pass"    : None,   # bool (passed on first attempt)
+        "sigma_first_pass"    : None,   # bool
+        "kql_generated"       : None,   # bool
         "retry_count"         : None,   # int
+        # --- FP rates (per format) ---
+        "fp_rate"             : None,   # float 0-1 (YARA-L FP rate)
+        "fp_rate_sigma"       : None,   # float 0-1 (Sigma FP rate)
+        "fp_rate_kql"         : None,   # float 0-1 (KQL FP rate)
+        "fp_count"            : None,   # int (YARA-L)
+        "needs_review"        : None,   # bool: any format exceeds 5% FP threshold
+        # --- performance ---
+        "latency_seconds"     : None,   # float
+        "estimated_cost_usd"  : None,   # float
         # --- raw ---
         "pipeline_result"     : None,
         "errors"              : [],
@@ -310,15 +328,62 @@ def _evaluate_fixture(
         gt.get("alt_actors", []),
     )
 
-    # Step 4: YARA-L rule scoring
+    # Step 4: Rule generation scoring
     retry_count = pipeline_out.get("retry_count", 0)
     final_rule  = pipeline_out.get("final_yaral_rule")
+    sigma_rule  = pipeline_out.get("sigma_rule")
+    kql_query   = pipeline_out.get("kql_query")
     result["retry_count"]      = retry_count
     result["yaral_first_pass"] = (final_rule is not None) and (retry_count == 0)
+    result["sigma_first_pass"] = sigma_rule is not None and "generation_error" not in str(
+        pipeline_out.get("sigma_generation_error") or ""
+    )
+    result["kql_generated"]    = kql_query is not None
 
+    # Step 5: FP rate checks -- all three formats
+    needs_review_any = False
+    if _FP_EVALUATOR_AVAILABLE:
+        for rule_text, fmt_key, rate_key in [
+            (final_rule,  "yaral",  "fp_rate"),
+            (sigma_rule,  "sigma",  "fp_rate_sigma"),
+            (kql_query,   "kql",    "fp_rate_kql"),
+        ]:
+            if not rule_text:
+                continue
+            try:
+                fp_result = run_fp_check(rule_text, fmt=fmt_key)
+                result[rate_key] = fp_result["fp_rate"]
+                if fmt_key == "yaral":
+                    result["fp_count"] = fp_result["fp_count"]
+                if fp_result.get("needs_review"):
+                    needs_review_any = True
+                if fp_result.get("error"):
+                    result["errors"].append(f"FP check ({fmt_key}) error: {fp_result['error']}")
+            except Exception as fp_exc:
+                result["errors"].append(f"FP check ({fmt_key}) exception: {fp_exc}")
+    result["needs_review"] = needs_review_any if _FP_EVALUATOR_AVAILABLE else None
+
+    # Step 6: Latency + cost
+    result["latency_seconds"] = elapsed
+    # Cost estimate: Groq llama-3.3-70b pricing
+    #   Input:  ~$0.59 / 1M tokens  ->  ~$0.000000148 / char (1 token ~= 4 chars)
+    #   Output: ~$0.79 / 1M tokens  ->  ~$0.000000198 / char
+    input_chars  = len(text) + 2000  # report + prompt overhead (~2 generation prompts)
+    output_chars = (
+        len(final_rule or "") + len(sigma_rule or "") + len(kql_query or "") + 500
+    )
+    result["estimated_cost_usd"] = round(
+        (input_chars * 0.000000148) + (output_chars * 0.000000198), 6
+    )
+
+    review_flag = " [NEEDS_REVIEW]" if needs_review_any else ""
     logger.info(
-        "[%s] Done in %.2fs | ioc_recall=%.2f | ttp_recall=%.2f | yaral_pass=%s",
+        "[%s] Done in %.2fs | ioc_recall=%.2f | ttp_recall=%.2f | yaral_pass=%s | fp_yaral=%s | fp_sigma=%s | fp_kql=%s%s",
         fid, elapsed, result["ioc_recall"], result["ttp_recall"], result["yaral_first_pass"],
+        f"{result['fp_rate']:.3f}" if result["fp_rate"] is not None else "N/A",
+        f"{result['fp_rate_sigma']:.3f}" if result["fp_rate_sigma"] is not None else "N/A",
+        f"{result['fp_rate_kql']:.3f}" if result["fp_rate_kql"] is not None else "N/A",
+        review_flag,
     )
     return result
 
@@ -410,6 +475,16 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
         "guard_true_positive_rate" : _safe_mean([float(r["guard_blocked"]) for r in results
                                                   if r.get("ioc_recall") is None
                                                   and r["guard_blocked"] is not None]),
+        # FP rate — only scored for fixtures that produced a YARA-L rule
+        "mean_fp_rate"             : _safe_mean([r["fp_rate"] for r in non_adv
+                                                  if r.get("fp_rate") is not None]),
+        # Latency + cost
+        "mean_latency_seconds"     : _safe_mean([r["latency_seconds"] for r in non_adv
+                                                  if r.get("latency_seconds") is not None]),
+        "total_estimated_cost_usd" : round(sum(
+            r["estimated_cost_usd"] for r in non_adv
+            if r.get("estimated_cost_usd") is not None
+        ), 5),
         "tier_breakdown"           : {
             "tier1": _tier_stats(1),
             "tier2": _tier_stats(2),
@@ -455,19 +530,22 @@ def print_report(results: list[dict[str, Any]], agg: dict[str, Any]) -> None:
 
     # Per-fixture table
     print(f"\n{'ID':<30} {'Tier':>4} {'Guard':>6} {'Schema':>7} {'IOC Rec':>8} {'IOC Pre':>8} {'IOC F1':>7} "
-          f"{'TTP Rec':>8} {'Actor':>6} {'YARAL 1st':>10} {'Retries':>8}")
+          f"{'TTP Rec':>8} {'Actor':>6} {'YARAL 1st':>10} {'Retries':>8} {'FP Rate':>8} {'Latency':>8}")
     print("-" * W)
 
     for r in results:
         guard = "BLOCK" if r["guard_blocked"] else "  OK "
         schema = _bool_str(r["schema_conformance"]) if r["schema_conformance"] is not None else "  N/A "
         tier = r.get("tier", "?")
+        fp_str = f"{r['fp_rate']*100:4.1f}%" if r.get("fp_rate") is not None else "  N/A "
+        lat_str = f"{r['latency_seconds']:.1f}s" if r.get("latency_seconds") is not None else "  N/A"
         print(
             f"{r['id']:<30} {tier:>4} {guard:>6} {schema:>13} "
             f"{_pct(r['ioc_recall']):>14} {_pct(r.get('ioc_precision')):>14} {_pct(r.get('ioc_f1')):>13} "
             f"{_pct(r['ttp_recall']):>14} "
             f"{_bool_str(r['actor_match']):>12} {_bool_str(r['yaral_first_pass']):>16} "
-            f"{'N/A' if r['retry_count'] is None else r['retry_count']:>8}"
+            f"{'N/A' if r['retry_count'] is None else r['retry_count']:>8} "
+            f"{fp_str:>8} {lat_str:>7}"
         )
         if r["errors"]:
             for e in r["errors"]:
@@ -487,6 +565,7 @@ def print_report(results: list[dict[str, Any]], agg: dict[str, Any]) -> None:
         ("YARA-L First-Pass Rate    ",  agg["yaral_first_pass_rate"]),
         ("Mean Retry Count (rule gen)", None),  # special
         ("Guard True Positive Rate  ",  agg["guard_true_positive_rate"]),
+        ("Mean FP Rate (benign set) ",  agg.get("mean_fp_rate")),
     ]
     for label, val in metrics:
         if label.startswith("Mean Retry"):
@@ -494,6 +573,15 @@ def print_report(results: list[dict[str, Any]], agg: dict[str, Any]) -> None:
             print(f"  {label}: {raw if raw is not None else 'N/A'}")
         else:
             print(f"  {label}: {_pct(val)}")
+
+    # Latency + cost summary
+    mean_lat = agg.get("mean_latency_seconds")
+    total_cost = agg.get("total_estimated_cost_usd")
+    if mean_lat is not None:
+        print(f"  Mean Pipeline Latency      : {mean_lat:.2f}s")
+    if total_cost is not None:
+        print(f"  Total Estimated Cost (USD) : ${total_cost:.5f}  "
+              f"[~${total_cost/max(agg['non_adversarial_fixtures'],1):.6f}/analysis — est. from char count]")
 
     # Per-tier breakdown
     tier_breakdown = agg.get("tier_breakdown", {})

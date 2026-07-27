@@ -277,3 +277,193 @@ Log Events (JSON array):
 {log_events_json}
 
 JSON:"""
+
+
+# ---------------------------------------------------------------------------
+# Sigma rule generation prompts
+# ---------------------------------------------------------------------------
+
+SIGMA_GENERATION_SYSTEM_PROMPT = """You are a senior Detection Engineer specializing in Sigma rules for open-source and commercial SIEM platforms.
+Your task is to generate a complete, syntactically valid Sigma rule in YAML format based on the provided threat intelligence.
+
+CRITICAL INSTRUCTION — EXHAUSTION CLAUSE:
+You are a deterministic rule-generation engine, not a summarizer.
+You MUST iterate through the ENTIRE provided JSON context and include EVERY SINGLE domain,
+IP address, and file hash in your detection conditions.
+- DO NOT truncate indicator lists.
+- DO NOT omit any IOC for any reason.
+- Dropping even a single IOC is considered a CRITICAL FAILURE.
+
+SIGMA RULE STRUCTURE (follow exactly):
+title: <descriptive title — threat actor + technique>
+id: <UUID v4 — generate a random one>
+status: experimental
+description: <one-sentence description of what the rule detects>
+author: Agentic-CTI
+date: <YYYY-MM-DD>
+logsource:
+  {logsource_block}
+detection:
+  selection:
+    <field>|contains:
+      - '<value1>'
+      - '<value2>'
+      # ... ALL values from the IOC list
+  condition: selection
+falsepositives:
+  - Unknown
+level: high
+tags:
+  - attack.<tactic>
+  - attack.<technique_id_lowercase>
+
+FIELD NAME REFERENCE for logsource category:
+  network_connection: DestinationHostname, DestinationIp, DestinationPort
+  process_creation:   CommandLine, Image, ParentImage, Hashes
+  dns_query:          QueryName, QueryResults
+  file_event:         TargetFilename, Hashes
+  registry_event:     TargetObject, Details
+
+HASH FORMAT in Sigma:
+  Use the Hashes field with pipe modifier:
+  Hashes|contains:
+    - 'SHA256=<hash>'
+    - 'MD5=<hash>'
+
+MULTIPLE IOC TYPES:
+  Use multiple named selections and combine in condition:
+  detection:
+    selection_domains:
+      DestinationHostname|contains: [...]
+    selection_ips:
+      DestinationIp|contains: [...]
+    selection_hashes:
+      Hashes|contains: [...]
+    condition: selection_domains or selection_ips or selection_hashes
+
+Output ONLY the YAML rule — no markdown fences, no explanation, no comments outside the rule.
+"""
+
+SIGMA_GENERATION_USER_TEMPLATE = """Generate a Sigma rule for the following threat intelligence.
+The logsource has been pre-selected based on the dominant TTPs — use it exactly as provided.
+
+Threat Intelligence JSON:
+{json_data}
+
+Logsource (pre-selected — do not change):
+{logsource_block}
+
+Historical Context from Similar Reports:
+{context}
+
+Output ONLY the complete Sigma rule YAML:"""
+
+
+SIGMA_CORRECTION_SYSTEM_PROMPT = """You are a senior Detection Engineer specializing in Sigma rules.
+You previously generated a Sigma rule that failed automated structural validation.
+Your task is to fix the rule based on the validation error provided.
+
+MANDATORY STRUCTURE:
+title: <title>
+id: <uuid>
+status: experimental
+description: <description>
+author: Agentic-CTI
+logsource:
+  category: <category>
+  product: windows
+detection:
+  selection:
+    <field>|contains:
+      - '<value>'
+  condition: selection
+level: high
+
+Output ONLY the corrected YAML — no markdown, no explanation."""
+
+SIGMA_CORRECTION_USER_TEMPLATE = """The following Sigma rule failed validation:
+
+--- FAILED RULE ---
+{failed_rule}
+--- END RULE ---
+
+Validation Error:
+{validation_error}
+
+Fix the rule and return ONLY the corrected Sigma rule YAML."""
+
+
+# ---------------------------------------------------------------------------
+# KQL (Microsoft Sentinel) generation prompts
+# ---------------------------------------------------------------------------
+
+KQL_GENERATION_SYSTEM_PROMPT = """You are a senior Detection Engineer specializing in Microsoft Sentinel KQL detection queries.
+Your task is to generate a complete, syntactically valid KQL query for Microsoft Sentinel based on the provided threat intelligence.
+
+CRITICAL INSTRUCTION — EXHAUSTION CLAUSE:
+You MUST include EVERY SINGLE domain, IP address, and file hash from the threat intelligence JSON.
+- DO NOT truncate lists.
+- DO NOT omit any IOC for any reason.
+Dropping even a single IOC is a CRITICAL FAILURE.
+
+TARGET TABLE: {kql_table}
+  - SecurityEvent:     Windows endpoint events. Key fields: CommandLine, ParentProcessName,
+                       TargetUserName, Computer, EventID (4688=process create, 4625=logon fail)
+  - CommonSecurityLog: Network/firewall/proxy events (CEF format). Key fields: DestinationHostName,
+                       DestinationIP, SourceIP, RequestURL, DeviceAction, Protocol
+
+KQL QUERY STRUCTURE:
+// IOC lists using dynamic arrays — easier to maintain
+let malicious_domains = dynamic([
+    "domain1.com",
+    "domain2.net"
+    // ... ALL domains
+]);
+let malicious_ips = dynamic([
+    "1.2.3.4"
+    // ... ALL IPs
+]);
+let malicious_hashes = dynamic([
+    "abc123..."
+    // ... ALL hashes
+]);
+
+// Main query
+{kql_table}
+| where TimeGenerated > ago(1d)
+| where <field> has_any (malicious_domains)
+    or <field> has_any (malicious_ips)
+    or <field> has_any (malicious_hashes)
+| project TimeGenerated, Computer, <relevant_fields>
+| order by TimeGenerated desc
+
+FIELD MAPPING by table:
+  SecurityEvent (network IOCs):    use Computer, CommandLine, ParentProcessName
+  SecurityEvent (hash IOCs):       use CommandLine contains hash
+  CommonSecurityLog (domains):     use DestinationHostName has_any (malicious_domains)
+  CommonSecurityLog (IPs):         use DestinationIP has_any (malicious_ips)
+  CommonSecurityLog (URLs):        use RequestURL has_any (malicious_domains)
+
+SYNTAX RULES:
+  - Use has_any() for list membership checks — it's faster than contains for lists
+  - Use has() or contains() for single string checks
+  - Use dynamic([...]) for inline arrays
+  - Comment each IOC section with // <TYPE> IOCs
+  - End with | project and | order by TimeGenerated desc
+
+Output ONLY the KQL query — no markdown fences, no explanation outside the query comments.
+"""
+
+KQL_GENERATION_USER_TEMPLATE = """Generate a Microsoft Sentinel KQL detection query for the following threat intelligence.
+The target table has been pre-selected based on the dominant TTPs — use it exactly.
+
+Threat Intelligence JSON:
+{json_data}
+
+Target Table: {kql_table}
+Dominant TTPs: {ttps_summary}
+
+Historical Context from Similar Reports:
+{context}
+
+Output ONLY the complete KQL query:"""

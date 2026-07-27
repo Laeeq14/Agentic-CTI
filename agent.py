@@ -27,7 +27,9 @@ from typing_extensions import TypedDict
 
 import vector_store as vs
 import validator as val
+import sigma_validator as sval
 from src.security.prompt_guard import scan as guard_scan, ScanResult
+from src.ttp_logsource_map import resolve_logsource, resolve_kql_table
 from prompts import (
     EXTRACTION_SYSTEM_PROMPT,
     EXTRACTION_USER_TEMPLATE,
@@ -37,6 +39,12 @@ from prompts import (
     YARAL_GENERATION_USER_TEMPLATE,
     ES_SYNTHESIS_SYSTEM_PROMPT,
     ES_SYNTHESIS_USER_TEMPLATE,
+    SIGMA_GENERATION_SYSTEM_PROMPT,
+    SIGMA_GENERATION_USER_TEMPLATE,
+    SIGMA_CORRECTION_SYSTEM_PROMPT,
+    SIGMA_CORRECTION_USER_TEMPLATE,
+    KQL_GENERATION_SYSTEM_PROMPT,
+    KQL_GENERATION_USER_TEMPLATE,
 )
 
 load_dotenv()
@@ -135,6 +143,14 @@ class ThreatIntelState(TypedDict):
     yaral_draft: Optional[str]
     yaral_validation_error: Optional[str]
     retry_count: int
+
+    # Sigma rule generation
+    sigma_rule: Optional[str]
+    sigma_generation_error: Optional[str]
+
+    # KQL query generation (Microsoft Sentinel)
+    kql_query: Optional[str]
+    kql_generation_error: Optional[str]
 
     # Final output
     final_yaral_rule: Optional[str]
@@ -567,6 +583,203 @@ def finalize(state: ThreatIntelState) -> ThreatIntelState:
 
 
 # ---------------------------------------------------------------------------
+# Node 3a: Sigma rule generation
+# ---------------------------------------------------------------------------
+
+MAX_SIGMA_RETRIES = 2
+
+
+def generate_sigma(state: ThreatIntelState) -> ThreatIntelState:
+    """
+    Node 3a — Generate a Sigma rule from the extracted threat intel.
+
+    Uses the TTP→logsource routing map to select the appropriate Sigma
+    logsource category/product before calling the LLM. This means logsource
+    is a parameter derived from intelligence, not a hardcoded assumption.
+
+    Runs a single correction pass on validation failure (max MAX_SIGMA_RETRIES).
+
+    NOTE — parallel fan-out contract:
+      This node runs concurrently with generate_kql (both fan out from
+      contextualize_with_rag). LangGraph merges the outputs of both branches
+      at the join node. To avoid INVALID_CONCURRENT_GRAPH_UPDATE every return
+      must yield ONLY the keys this node owns ('sigma_rule',
+      'sigma_generation_error'). Spreading **state would cause LangGraph to
+      see two values for every shared key (raw_text, extracted_report, …)
+      and raise a merge conflict.
+
+    Args:
+        state: Current graph state. Expects 'extracted_report' and 'rag_context'.
+
+    Returns:
+        Partial state dict containing only 'sigma_rule' and
+        'sigma_generation_error'.
+    """
+    logger.info("[Node 3a] Generating Sigma rule...")
+
+    report: ThreatIntelReport = state.get("extracted_report")
+    if not report:
+        logger.warning("[Node 3a] No extracted report — skipping Sigma generation.")
+        return {"sigma_rule": None, "sigma_generation_error": "No extracted report available."}
+
+    rag_context: dict = state.get("rag_context") or {}
+    matches = rag_context.get("matches", [])
+    context_str = (
+        "Similar historical reports:\n" + "\n".join(
+            f"- Threat actor: {m['threat_actor']}, TTPs: {', '.join(m['mitre_ttps'])}, Score: {m['score']:.4f}"
+            for m in matches
+        )
+    ) if matches else "No similar historical reports found in the knowledge base."
+
+    # Resolve logsource from TTPs — parameterized, not hardcoded
+    logsource = resolve_logsource(report.mitre_ttps)
+    logsource_lines = "\n".join(f"  {k}: {v}" for k, v in logsource.items())
+    logsource_block = logsource_lines.strip()
+
+    json_data = report.model_dump_json(indent=2)
+    llm = _get_llm(temperature=0.2)
+
+    sigma_draft: Optional[str] = None
+    last_error: Optional[str] = None
+
+    for attempt in range(MAX_SIGMA_RETRIES):
+        try:
+            if attempt == 0:
+                messages = [
+                    SystemMessage(content=SIGMA_GENERATION_SYSTEM_PROMPT.replace("{logsource_block}", logsource_block)),
+                    HumanMessage(
+                        content=SIGMA_GENERATION_USER_TEMPLATE.format(
+                            json_data=json_data,
+                            logsource_block=logsource_block,
+                            context=context_str,
+                        )
+                    ),
+                ]
+            else:
+                messages = [
+                    SystemMessage(content=SIGMA_CORRECTION_SYSTEM_PROMPT),
+                    HumanMessage(
+                        content=SIGMA_CORRECTION_USER_TEMPLATE.format(
+                            failed_rule=sigma_draft or "",
+                            validation_error=last_error or "",
+                        )
+                    ),
+                ]
+
+            response = llm.invoke(messages)
+            sigma_draft = sval.extract_sigma_from_response(response.content)
+            is_valid, err = sval.validate_sigma_rule(sigma_draft)
+
+            if is_valid:
+                logger.info("[Node 3a] ✅ Sigma rule validated (attempt %d).", attempt + 1)
+                # Return ONLY owned keys — no **state spread (parallel fan-out contract)
+                return {"sigma_rule": sigma_draft, "sigma_generation_error": None}
+            else:
+                logger.warning("[Node 3a] Sigma validation failed (attempt %d): %s", attempt + 1, err[:200])
+                last_error = err
+
+        except Exception as e:
+            last_error = f"LLM call failed: {type(e).__name__}: {e}"
+            logger.exception("[Node 3a] ❌ %s", last_error)
+            break
+
+    # All attempts failed — store whatever draft we have (best effort)
+    logger.error("[Node 3a] ❌ Sigma generation exhausted %d attempts.", MAX_SIGMA_RETRIES)
+    # Return ONLY owned keys — no **state spread (parallel fan-out contract)
+    return {
+        "sigma_rule": sigma_draft,
+        "sigma_generation_error": last_error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 3b: KQL (Microsoft Sentinel) query generation
+# ---------------------------------------------------------------------------
+
+
+def generate_kql(state: ThreatIntelState) -> ThreatIntelState:
+    """
+    Node 3b — Generate a Microsoft Sentinel KQL detection query.
+
+    Uses the same TTP→logsource routing map to select SecurityEvent vs.
+    CommonSecurityLog, mirroring the Sigma logsource split so both generators
+    stay in sync when new TTP mappings are added.
+
+    No retry loop — KQL syntax is simpler and LLMs get it right first-pass
+    more reliably than YARA-L or Sigma YAML.
+
+    NOTE — parallel fan-out contract:
+      This node runs concurrently with generate_sigma (both fan out from
+      contextualize_with_rag). Every return must yield ONLY the keys this node
+      owns ('kql_query', 'kql_generation_error'). Spreading **state would
+      cause LangGraph to see two values for every shared key and raise
+      INVALID_CONCURRENT_GRAPH_UPDATE at the fan-in join.
+
+    Args:
+        state: Current graph state. Expects 'extracted_report' and 'rag_context'.
+
+    Returns:
+        Partial state dict containing only 'kql_query' and
+        'kql_generation_error'.
+    """
+    logger.info("[Node 3b] Generating Sentinel KQL query...")
+
+    report: ThreatIntelReport = state.get("extracted_report")
+    if not report:
+        logger.warning("[Node 3b] No extracted report — skipping KQL generation.")
+        # Return ONLY owned keys — no **state spread (parallel fan-out contract)
+        return {"kql_query": None, "kql_generation_error": "No extracted report available."}
+
+    rag_context: dict = state.get("rag_context") or {}
+    matches = rag_context.get("matches", [])
+    context_str = (
+        "Similar historical reports:\n" + "\n".join(
+            f"- Threat actor: {m['threat_actor']}, TTPs: {', '.join(m['mitre_ttps'])}, Score: {m['score']:.4f}"
+            for m in matches
+        )
+    ) if matches else "No similar historical reports found in the knowledge base."
+
+    # Resolve KQL table from TTPs — same routing logic as Sigma
+    kql_table = resolve_kql_table(report.mitre_ttps)
+    ttps_summary = ", ".join(report.mitre_ttps[:10]) or "Unknown"
+    json_data = report.model_dump_json(indent=2)
+
+    llm = _get_llm(temperature=0.1)
+
+    try:
+        system_prompt = KQL_GENERATION_SYSTEM_PROMPT.replace("{kql_table}", kql_table)
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(
+                content=KQL_GENERATION_USER_TEMPLATE.format(
+                    json_data=json_data,
+                    kql_table=kql_table,
+                    ttps_summary=ttps_summary,
+                    context=context_str,
+                )
+            ),
+        ]
+
+        response = llm.invoke(messages)
+        # Strip markdown fences if present
+        kql_raw = response.content.strip()
+        fence_match = __import__("re").search(
+            r"```(?:kql|kusto|text|plaintext)?\s*\n?(.*?)```", kql_raw, __import__("re").DOTALL | __import__("re").IGNORECASE
+        )
+        kql_query = fence_match.group(1).strip() if fence_match else kql_raw
+
+        logger.info("[Node 3b] ✅ KQL query generated (%d chars).", len(kql_query))
+        # Return ONLY owned keys — no **state spread (parallel fan-out contract)
+        return {"kql_query": kql_query, "kql_generation_error": None}
+
+    except Exception as e:
+        msg = f"KQL generation failed: {type(e).__name__}: {e}"
+        logger.exception("[Node 3b] ❌ %s", msg)
+        # Return ONLY owned keys — no **state spread (parallel fan-out contract)
+        return {"kql_query": None, "kql_generation_error": msg}
+
+
+# ---------------------------------------------------------------------------
 # Node 0.5 (ES path): Query Elasticsearch logs
 # ---------------------------------------------------------------------------
 
@@ -815,7 +1028,9 @@ def _build_graph() -> Any:
 
     # Shared downstream pipeline
     workflow.add_node("contextualize_with_rag", contextualize_with_rag)  # Node 2
-    workflow.add_node("generate_yaral", generate_yaral)                  # Node 3
+    workflow.add_node("generate_sigma", generate_sigma)                  # Node 3a
+    workflow.add_node("generate_kql", generate_kql)                      # Node 3b
+    workflow.add_node("generate_yaral", generate_yaral)                  # Node 3c
     workflow.add_node("validate_yaral", validate_yaral)                  # Node 4
     workflow.add_node("finalize", finalize)                              # Node 5
 
@@ -866,8 +1081,25 @@ def _build_graph() -> Any:
         },
     )
 
-    # ── Shared downstream edges ──────────────────────────────────────────────
-    workflow.add_edge("contextualize_with_rag", "generate_yaral")
+    # -- Shared downstream edges -----------------------------------------------
+    # Sigma and KQL are independent of each other -- both only need the
+    # extracted_report from RAG. Fan them out in parallel so they run
+    # concurrently, then join at generate_yaral before the retry loop.
+    #
+    # Graph topology:
+    #   contextualize_with_rag --+-- generate_sigma --+-- generate_yaral --> validate_yaral
+    #                            +-- generate_kql   --+        ^                    |
+    #                                                          | (retry)            |
+    #                                                          +--------------------+
+    #
+    # LangGraph fan-in semantics: generate_yaral waits for ALL nodes that
+    # triggered it in the SAME step. On the initial run that's both
+    # generate_sigma and generate_kql. On retry it's only validate_yaral
+    # (sigma/kql are already done), so no extra waiting occurs.
+    workflow.add_edge("contextualize_with_rag", "generate_sigma")   # parallel fan-out
+    workflow.add_edge("contextualize_with_rag", "generate_kql")     # parallel fan-out
+    workflow.add_edge("generate_sigma", "generate_yaral")           # join (waits for both)
+    workflow.add_edge("generate_kql", "generate_yaral")             # join
     workflow.add_edge("generate_yaral", "validate_yaral")
     workflow.add_conditional_edges(
         "validate_yaral",
@@ -939,6 +1171,10 @@ def run_pipeline(text: str) -> ThreatIntelState:
         "extraction_error": None,
         "llm_raw_response": None,
         "rag_context": None,
+        "sigma_rule": None,
+        "sigma_generation_error": None,
+        "kql_query": None,
+        "kql_generation_error": None,
         "yaral_draft": None,
         "yaral_validation_error": None,
         "retry_count": 0,
@@ -992,6 +1228,10 @@ def run_pipeline_from_logs(
         "extraction_error": None,
         "llm_raw_response": None,
         "rag_context": None,
+        "sigma_rule": None,
+        "sigma_generation_error": None,
+        "kql_query": None,
+        "kql_generation_error": None,
         "yaral_draft": None,
         "yaral_validation_error": None,
         "retry_count": 0,

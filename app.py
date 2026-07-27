@@ -772,7 +772,7 @@ def main() -> None:
     <div class="cti-header">
       <div class="cti-header-left">
         <h1>AGENTIC-CTI</h1>
-        <p>DETECTION-AS-CODE PIPELINE // LangGraph + Groq/Llama-3.3 // Qdrant RAG // YARA-L 2.0</p>
+        <p>DETECTION-AS-CODE PIPELINE // LangGraph + Groq/Llama-3.3 // Qdrant RAG // YARA-L 2.0 · Sigma · KQL</p>
       </div>
       <div class="cti-status-bar">
         <div class="cti-status-item">
@@ -791,8 +791,8 @@ def main() -> None:
         </div>
         <div class="cti-status-divider"></div>
         <div class="cti-status-item">
-          <div class="label">Rule Format</div>
-          <div class="value">YARA-L 2.0</div>
+          <div class="label">Formats</div>
+          <div class="value">YARA-L · Sigma · KQL</div>
         </div>
       </div>
     </div>
@@ -908,17 +908,26 @@ def main() -> None:
             st.write("▸ Node 0 — Prompt injection scan…")
             st.write("▸ Node 1 — Extracting structured intelligence via Llama-3.3…")
             try:
+                import time as _time
+                _t0 = _time.perf_counter()
                 result = run_pipeline(report_text)
+                elapsed_seconds = _time.perf_counter() - _t0
 
                 # Show accurate per-node status based on actual results
                 if result.get("extracted_report"):
                     st.write("▸ Node 1 — Extraction complete.")
                     st.write("▸ Node 2 — RAG similarity search complete.")
+                    sigma_ok = result.get("sigma_rule") is not None
+                    kql_ok = result.get("kql_query") is not None
+                    st.write(
+                        f"▸ Node 3a — Sigma rule {'generated.' if sigma_ok else "generation failed — see output tab."}")
+                    st.write(
+                        f"▸ Node 3b — Sentinel KQL query {'generated.' if kql_ok else "generation failed — see output tab."}")
                     if result.get("final_yaral_rule"):
-                        st.write("▸ Node 3/4 — YARA-L generated and validated.")
-                        status.update(label="✓ Pipeline complete — detection rule ready.", state="complete", expanded=False)
+                        st.write("▸ Node 3c/4 — YARA-L generated and validated.")
+                        status.update(label="✓ Pipeline complete — all detection formats ready.", state="complete", expanded=False)
                     else:
-                        st.write("▸ Node 3/4 — YARA-L generation exhausted retries.")
+                        st.write("▸ Node 3c/4 — YARA-L generation exhausted retries.")
                         status.update(label="✗ YARA-L generation failed after retries.", state="error", expanded=False)
                 else:
                     err = result.get("extraction_error") or "LLM did not return valid JSON"
@@ -943,6 +952,8 @@ def main() -> None:
         extracted: ThreatIntelReport | None = result.get("extracted_report")
         rag: dict = result.get("rag_context") or {}
         final_rule: str | None = result.get("final_yaral_rule")
+        sigma_rule: str | None = result.get("sigma_rule")
+        kql_query: str | None = result.get("kql_query")
         validation_err: str | None = result.get("yaral_validation_error")
         retry_count: int = result.get("retry_count", 0)
 
@@ -1092,65 +1103,160 @@ def main() -> None:
             st.markdown("</div>", unsafe_allow_html=True)
 
         # ================================================================
-        # RIGHT COLUMN — YARA-L Detection Rule (maximum width)
+        # RIGHT COLUMN — Detection Rules (tabbed: YARA-L / Sigma / KQL)
         # ================================================================
         with right_col:
 
-            # Rule status badge HTML
-            if final_rule:
-                status_badge = '<span class="yaral-status-badge badge-validated">✓ VALIDATED</span>'
-            else:
-                status_badge = '<span class="yaral-status-badge badge-failed">✗ FAILED</span>'
-
-            retry_info = ""
-            if retry_count > 0:
-                retry_info = (
-                    f'<span style="font-size:0.65rem; color:#ffb84d; margin-left:10px;">'
-                    f'{"corrected after" if final_rule else "exhausted"} {retry_count} retr{"y" if retry_count==1 else "ies"}'
-                    f'</span>'
-                )
-
-            st.markdown(
-                f"""
-                <div class="yaral-container">
-                  <div class="yaral-titlebar">
-                    <div class="yaral-title-left">
-                      YARA-L 2.0 // Google SecOps Detection Rule{retry_info}
-                    </div>
-                    {status_badge}
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+            rule_name = (
+                extracted.threat_actor.lower().replace(" ", "_").replace("(", "").replace(")", "")
+                if extracted else "rule"
             )
 
-            if final_rule:
-                st.markdown('<div class="yaral-code-inner">', unsafe_allow_html=True)
-                st.code(final_rule, language="text")
-                st.markdown("</div>", unsafe_allow_html=True)
+            tab_yaral, tab_sigma, tab_kql = st.tabs(
+                ["🛡 YARA-L 2.0  (Google SecOps)", "Σ  Sigma  (SIEM-agnostic)", "☁  KQL  (Microsoft Sentinel)"]
+            )
 
-                rule_name = (
-                    extracted.threat_actor.lower().replace(" ", "_").replace("(", "").replace(")", "")
-                    if extracted else "rule"
-                )
-                st.download_button(
-                    label="⬇  EXPORT  //  Download .yaral rule file",
-                    data=final_rule,
-                    file_name=f"agentic_cti_{rule_name}.yaral",
-                    mime="text/plain",
-                    key="dl_rule",
-                )
-            else:
+            # ── Tab 1: YARA-L ───────────────────────────────────────────
+            with tab_yaral:
+                if final_rule:
+                    status_badge = '<span class="yaral-status-badge badge-validated">✓ VALIDATED</span>'
+                else:
+                    status_badge = '<span class="yaral-status-badge badge-failed">✗ FAILED</span>'
+
+                retry_info = ""
+                if retry_count > 0:
+                    retry_info = (
+                        f'<span style="font-size:0.65rem; color:#ffb84d; margin-left:10px;">'
+                        f'{"corrected after" if final_rule else "exhausted"} {retry_count} retr{"y" if retry_count==1 else "ies"}'
+                        f'</span>'
+                    )
+
                 st.markdown(
-                    '<div class="cti-error">✗ Could not produce a valid YARA-L rule after maximum retries.</div>',
+                    f"""
+                    <div class="yaral-container">
+                      <div class="yaral-titlebar">
+                        <div class="yaral-title-left">
+                          YARA-L 2.0 // Google SecOps Detection Rule{retry_info}
+                        </div>
+                        {status_badge}
+                      </div>
+                    </div>
+                    """,
                     unsafe_allow_html=True,
                 )
-                if validation_err:
-                    with st.expander("View Last Validation Error"):
-                        st.code(validation_err, language="text")
-                if result.get("yaral_draft"):
-                    with st.expander("View Last Draft (unvalidated)"):
-                        st.code(result["yaral_draft"], language="text")
+
+                if final_rule:
+                    st.markdown('<div class="yaral-code-inner">', unsafe_allow_html=True)
+                    st.code(final_rule, language="text")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                    st.download_button(
+                        label="⬇  EXPORT  //  Download .yaral rule file",
+                        data=final_rule,
+                        file_name=f"agentic_cti_{rule_name}.yaral",
+                        mime="text/plain",
+                        key="dl_yaral",
+                    )
+                else:
+                    st.markdown(
+                        '<div class="cti-error">✗ Could not produce a valid YARA-L rule after maximum retries.</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if validation_err:
+                        with st.expander("View Last Validation Error"):
+                            st.code(validation_err, language="text")
+                    if result.get("yaral_draft"):
+                        with st.expander("View Last Draft (unvalidated)"):
+                            st.code(result["yaral_draft"], language="text")
+
+            # ── Tab 2: Sigma ─────────────────────────────────────────────
+            with tab_sigma:
+                sigma_err = result.get("sigma_generation_error")
+                logsource_hint = ""
+                if sigma_rule:
+                    # Extract logsource from the YAML to display as a hint
+                    import re as _re
+                    ls_match = _re.search(r"logsource:\s*\n((?:  .+\n)+)", sigma_rule)
+                    if ls_match:
+                        logsource_hint = ls_match.group(1).strip()
+
+                sigma_badge = (
+                    '<span class="yaral-status-badge badge-validated">✓ GENERATED</span>'
+                    if sigma_rule and not sigma_err
+                    else '<span class="yaral-status-badge badge-failed">⚠ PARTIAL</span>'
+                    if sigma_rule
+                    else '<span class="yaral-status-badge badge-failed">✗ FAILED</span>'
+                )
+
+                st.markdown(
+                    f"""
+                    <div class="yaral-container">
+                      <div class="yaral-titlebar">
+                        <div class="yaral-title-left">
+                          Sigma Rule // SIEM-agnostic Detection Format
+                          {f'<span style="font-size:0.65rem; color:#00d4ff; margin-left:10px;">logsource: {logsource_hint}</span>' if logsource_hint else ''}
+                        </div>
+                        {sigma_badge}
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                if sigma_rule:
+                    st.code(sigma_rule, language="yaml")
+                    st.download_button(
+                        label="⬇  EXPORT  //  Download .yml Sigma rule",
+                        data=sigma_rule,
+                        file_name=f"agentic_cti_{rule_name}.yml",
+                        mime="text/plain",
+                        key="dl_sigma",
+                    )
+                    if sigma_err:
+                        with st.expander("⚠ Sigma validation warning"):
+                            st.code(sigma_err, language="text")
+                else:
+                    st.markdown(
+                        f'<div class="cti-error">✗ Sigma generation failed: {sigma_err or "Unknown error"}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            # ── Tab 3: KQL ───────────────────────────────────────────────
+            with tab_kql:
+                kql_err = result.get("kql_generation_error")
+                kql_badge = (
+                    '<span class="yaral-status-badge badge-validated">✓ GENERATED</span>'
+                    if kql_query
+                    else '<span class="yaral-status-badge badge-failed">✗ FAILED</span>'
+                )
+
+                st.markdown(
+                    f"""
+                    <div class="yaral-container">
+                      <div class="yaral-titlebar">
+                        <div class="yaral-title-left">
+                          KQL Detection Query // Microsoft Sentinel
+                        </div>
+                        {kql_badge}
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                if kql_query:
+                    st.code(kql_query, language="sql")
+                    st.download_button(
+                        label="⬇  EXPORT  //  Download .kql query file",
+                        data=kql_query,
+                        file_name=f"agentic_cti_{rule_name}.kql",
+                        mime="text/plain",
+                        key="dl_kql",
+                    )
+                else:
+                    st.markdown(
+                        f'<div class="cti-error">✗ KQL generation failed: {kql_err or "Unknown error"}</div>',
+                        unsafe_allow_html=True,
+                    )
 
             # ── Pipeline Metadata Grid ────────────────────────────────
             st.markdown('<div class="soc-card" style="margin-top:12px;">', unsafe_allow_html=True)
@@ -1163,6 +1269,8 @@ def main() -> None:
             score_class = "ok" if top_score >= 0.7 else ("warn" if top_score >= 0.4 else "")
             ioc_c = ioc_total if extracted else 0
             ttp_c = len(extracted.mitre_ttps) if extracted else 0
+            sigma_status_str = "✓" if sigma_rule and not result.get("sigma_generation_error") else ("⚠" if sigma_rule else "✗")
+            kql_status_str = "✓" if kql_query else "✗"
 
             st.markdown(
                 f"""
@@ -1176,7 +1284,7 @@ def main() -> None:
                     <div class="meta-value" style="font-size:0.85rem;">Groq API</div>
                   </div>
                   <div class="meta-item">
-                    <div class="meta-label">Retries Used</div>
+                    <div class="meta-label">YARA-L Retries</div>
                     <div class="meta-value {retry_class}">{retry_count}/3</div>
                   </div>
                   <div class="meta-item">
@@ -1191,8 +1299,52 @@ def main() -> None:
                     <div class="meta-label">RAG Score</div>
                     <div class="meta-value {score_class}">{top_score:.4f}</div>
                   </div>
+                  <div class="meta-item">
+                    <div class="meta-label">Sigma</div>
+                    <div class="meta-value {'ok' if sigma_rule else ''}">{sigma_status_str}</div>
+                  </div>
+                  <div class="meta-item">
+                    <div class="meta-label">KQL</div>
+                    <div class="meta-value {'ok' if kql_query else ''}">{kql_status_str}</div>
+                  </div>
                 </div>
                 """,
+                unsafe_allow_html=True,
+            )
+            # Pipeline Time bar + FP threshold gate -------------------------
+            try:
+                from tests.eval.fp_evaluator import run_fp_check as _fpcheck, FP_RATE_THRESHOLD as _FPTHRESH
+                _msgs: list[str] = []
+                for _rt, _fm in [
+                    (result.get("final_yaral_rule"), "yaral"),
+                    (result.get("sigma_rule"),       "sigma"),
+                    (result.get("kql_query"),         "kql"),
+                ]:
+                    if _rt:
+                        _rv = _fpcheck(_rt, fmt=_fm)
+                        if _rv.get("needs_review"):
+                            _msgs.append(
+                                f"{_fm.upper()}: {_rv['fp_rate']*100:.1f}% FP rate "
+                                f"({_rv['fp_count']} of {_rv['total_benign_events']} benign events matched)"
+                            )
+                if _msgs:
+                    _thresh_pct = int(_FPTHRESH * 100)
+                    _detail = "  \n".join(_msgs)
+                    st.warning(
+                        f"FP THRESHOLD EXCEEDED (>{_thresh_pct}%) — review IOC specificity before deploying:\n"
+                        f"  {_detail}",
+                        icon="⚠️",
+                    )
+            except ImportError:
+                pass
+            st.markdown(
+                f"""<div style="margin-top:8px;padding:6px 12px;background:rgba(0,212,255,0.04);
+                             border-radius:4px;font-family:'JetBrains Mono',monospace;
+                             font-size:0.78rem;color:#4a8fa8;">
+                    PIPELINE TIME: <span style="color:{'#00d4ff' if elapsed_seconds<30 else '#ffaa00'}">{elapsed_seconds:.1f}s</span>
+                    &nbsp;&nbsp;|&nbsp;&nbsp;
+                    FORMATS: YARA-L 2.0 &bull; Sigma &bull; KQL
+                </div>""",
                 unsafe_allow_html=True,
             )
             st.markdown("</div>", unsafe_allow_html=True)
