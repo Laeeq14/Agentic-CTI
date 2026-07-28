@@ -47,7 +47,8 @@ This is not an LLM wrapper. It is an end-to-end SOC automation platform that acc
 |---|---|
 | **Dual ingestion paths** | Text threat reports *and* live Elasticsearch log queries both produce detection rules through the same pipeline |
 | **Triple rule output** | Generates YARA-L 2.0 (Google SecOps), Sigma (SIEM-agnostic), and KQL (Microsoft Sentinel) from a single analysis pass |
-| **Parallel generation** | Sigma and KQL fan out from RAG simultaneously (LangGraph parallel branches), then join before YARA-L — ~2× faster than sequential |
+| **Parallel generation** | Sigma and KQL fan out from RAG simultaneously (LangGraph parallel branches on separate OS threads), then join before YARA-L — ~2× faster than sequential |
+| **Rate-limit resilience** | Three-account Groq API key pool; on a 429 the pipeline rotates to the next account immediately (no sleep) before falling back to Retry-After-based backoff with ±2s jitter. Thread-safe writes guarded by `threading.Lock` — parallel branches cannot produce lost-update corruption on the shared key index |
 | **FP rate measurement** | Rules checked against a 125-event benign traffic dataset; rules exceeding 5% FP rate are flagged `needs_review` before the analyst sees them |
 | **Navigator export** | `/api/navigator-layer` endpoint emits ATT&CK Navigator v4.9 layers with frequency-proportional color gradients |
 | **CI/CD regression gate** | GitHub Actions workflow runs dry-run eval on every PR; live subset with IOC F1 ≥ 90% and Guard TPR = 100% thresholds on `run-live-eval` label — guards against silent LLM regression |
@@ -232,7 +233,8 @@ python evals/deepeval_suite.py
 - **Sigma First-Pass Rate** — Sigma YAML rules passing structural validation on the first attempt
 - **KQL Generation Rate** — percentage of fixtures that produced a usable KQL query
 - **Mean FP Rate (YARA-L / Sigma / KQL)** — fraction of 125 benign events matched by the rule; rules exceeding 5% are flagged `needs_review`
-- **Mean Pipeline Latency** — wall-clock seconds from input to finalized output
+- **Mean Pipeline Latency** — wall-clock seconds from input to finalized output; includes any rate-limit backoff sleep
+- **Rate-limit Backoff Sleep (`rate_limit_sleep_s`)** — seconds spent sleeping for Retry-After backoff across the run; non-zero values mean `Mean Pipeline Latency` is inflated and the eval report will print the adjusted net inference latency separately
 - **Estimated Cost per Analysis** — approximate Groq API cost based on token count heuristics
 
 > Run `python tests/eval/eval_runner.py --live` to generate your own benchmark results.
@@ -273,7 +275,7 @@ alb_dns_name = "agentic-cti-alb-xxxx.us-east-2.elb.amazonaws.com"
 |---|---|
 | **Prompt injection guard** | 7 threat categories, regex-based, < 1ms, runs before every LLM call |
 | **YARA-L validator** | 9 deterministic structural checks; LLM retries on failure (max 3×) |
-| **API key management** | `GROQ_API_KEY` loaded from `.env` locally; AWS Secrets Manager in production |
+| **API key management** | `GROQ_API_KEY` (+ optional `GROQ_API_KEY_2/3`) loaded from `.env` locally; AWS Secrets Manager in production. On a 429, the pipeline rotates to the next account before sleeping — see `.env.example` |
 | **API key enforcement** | Optional `X-API-Key` header auth on all `/api/*` endpoints — set `API_KEY` env var to enable; transparent no-op in dev mode when unset |
 | **Least-privilege IAM** | Separate execution role (pull secrets, write logs) and task role (S3 only) |
 | **ES auth** | Controlled by `ES_SECURITY_ENABLED` env var — `false` by default for local dev; set to `true` in `.env` with `ELASTIC_PASSWORD` for production (volume must be cleared on first toggle) |
@@ -292,8 +294,16 @@ python -m venv .venv
 .venv\Scripts\activate          # Windows
 pip install -r requirements.txt
 
-# Environment
-echo "GROQ_API_KEY=gsk_xxxx" > .env
+# Environment — copy the template and fill in your key(s)
+cp .env.example .env
+
+# Required: primary Groq account
+# GROQ_API_KEY=gsk_xxxx
+
+# Optional: overflow accounts for rate-limit rotation.
+# The pipeline rotates to the next key on a 429 before sleeping.
+# GROQ_API_KEY_2=gsk_xxxx
+# GROQ_API_KEY_3=gsk_xxxx
 
 # Run Streamlit directly (connects to local Qdrant)
 streamlit run app.py
@@ -366,6 +376,7 @@ Agentic-CTI/
 - **Embeddings:** `all-MiniLM-L6-v2` (sentence-transformers, local, no API key)
 - **Vector DB:** Qdrant (cosine similarity, persistent local volume)
 - **Log DB:** Elasticsearch 8.13 (single-node for dev, cluster-ready for prod)
+- **API key pool:** Up to 3 Groq accounts (`GROQ_API_KEY`, `GROQ_API_KEY_2`, `GROQ_API_KEY_3`); rotated on 429 via sticky round-robin before Retry-After sleep
 
 ---
 

@@ -15,7 +15,10 @@ with the validation error embedded in the prompt (max MAX_RETRIES attempts).
 import json
 import logging
 import os
+import random
 import re
+import threading
+import time
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -156,6 +159,11 @@ class ThreatIntelState(TypedDict):
     final_yaral_rule: Optional[str]
     pipeline_error: Optional[str]
 
+    # Rate-limit telemetry — total seconds slept across all backoff events
+    # in this pipeline run.  0.0 means no throttling occurred.
+    # Set by run_pipeline; used by the eval runner to flag inflated latency.
+    rate_limit_sleep_s: float
+
 
 # ---------------------------------------------------------------------------
 # LLM factory
@@ -182,6 +190,193 @@ def _get_llm(temperature: float = 0.1) -> ChatGroq:
         )
     model = os.getenv("GROQ_MODEL", "llama3-70b-8192")
     return ChatGroq(api_key=api_key, model_name=model, temperature=temperature)
+
+
+# ---------------------------------------------------------------------------
+# API key pool — rotated on per-account rate-limit exhaustion
+# ---------------------------------------------------------------------------
+
+def _load_api_key_pool() -> list[str]:
+    """
+    Collect all Groq API keys from the environment.
+
+    Reads GROQ_API_KEY (primary) plus GROQ_API_KEY_2, GROQ_API_KEY_3, …
+    (overflow accounts) and returns them as an ordered list, deduplicated
+    while preserving insertion order.  At least one key must be present or
+    _get_llm() will raise EnvironmentError on first use.
+    """
+    seen: set[str] = set()
+    keys: list[str] = []
+    for var in ("GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3"):
+        val = os.getenv(var, "").strip()
+        if val and val not in seen:
+            seen.add(val)
+            keys.append(val)
+    return keys
+
+
+_API_KEY_POOL: list[str] = []  # populated lazily on first LLM call
+_current_key_idx: int = 0      # sticky: persists across requests for round-robin load-balancing
+_rate_limit_sleep_total: float = 0.0  # accumulated sleep time; reset by run_pipeline per-request
+
+# Thread-safety: generate_sigma and generate_kql run on separate OS threads
+# inside LangGraph's ThreadPoolExecutor fan-out. Both write to the two globals
+# above. Two lightweight locks protect those write paths without blocking
+# the (CPython-atomic) reads.
+#
+# Lock choice — threading.Lock (not RLock):
+#   Plain Lock is correct here because no code path acquires either lock and
+#   then calls back into a function that acquires the same lock again (no
+#   nested/re-entrant acquisition). If that ever changes — e.g. a helper that
+#   calls _llm_invoke_with_backoff from inside a locked block — switch to
+#   threading.RLock, or you'll get a silent deadlock rather than a clear error.
+_key_idx_lock: threading.Lock   = threading.Lock()   # guards writes to _current_key_idx
+_sleep_total_lock: threading.Lock = threading.Lock()  # guards += on _rate_limit_sleep_total
+
+
+def _get_key_pool() -> list[str]:
+    """Return the key pool, initialising it from the environment if needed."""
+    global _API_KEY_POOL
+    if not _API_KEY_POOL:
+        _API_KEY_POOL = _load_api_key_pool()
+    return _API_KEY_POOL
+
+
+# ---------------------------------------------------------------------------
+# Retry-After-based LLM invocation helper
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_WAIT_CAP = 120.0  # never sleep more than 2 minutes
+_RATE_LIMIT_JITTER   =   2.0  # ± seconds of random jitter added to every sleep
+
+
+def _llm_invoke_with_backoff(llm: ChatGroq, messages: list, max_attempts: int = 3):
+    """
+    Invoke *llm* with *messages* using Retry-After-based back-off.
+
+    On a Groq 429 RateLimitError the helper:
+      1. Tries the *next* API key in the pool (if one exists) before sleeping.
+         This immediately unblocks requests if the first account's TPM budget
+         is exhausted but another account still has headroom.
+      2. If no fresh key is available, parses the server-suggested wait time
+         from the Groq error body — e.g. ``'Please try again in 8.85s.'`` —
+         adds a fixed 2 s buffer plus ±2 s random jitter (to reduce thundering-
+         herd collisions when Sigma and KQL retry simultaneously), then sleeps.
+      3. If the error message does not contain the expected ``try again in Xs``
+         string (e.g. a proxy timeout or a future Groq format change), falls
+         back to a fixed 20 s delay so the function degrades gracefully rather
+         than crashing.
+
+    All other (non-rate-limit) exceptions are re-raised immediately.
+
+    Args:
+        llm:          A configured ``ChatGroq`` instance used for the *first*
+                      attempt.  Subsequent attempts may switch to a different
+                      API key from the pool.
+        messages:     List of ``SystemMessage``/``HumanMessage`` objects.
+        max_attempts: Maximum total call attempts across all keys (default: 3).
+
+    Returns:
+        The LLM response object returned by ``llm.invoke()``.
+
+    Raises:
+        Exception: Re-raises the last rate-limit exception when all attempts
+                   across all keys are exhausted, or any non-rate-limit
+                   exception on first occurrence.
+    """
+    # _rate_limit_sleep_total and _current_key_idx are written under their
+    # respective locks inside _llm_invoke_with_backoff; reads of the int
+    # _current_key_idx here are CPython-atomic and need no lock.
+    global _rate_limit_sleep_total
+
+    pool = _get_key_pool()
+    # Snapshot the current key index once at entry.  This is a read-only
+    # snapshot: the branch never writes _current_key_idx mid-flight.
+    # The write happens inside the lock only on success (see below).
+    # groq_api_key is a Pydantic SecretStr; unwrap before comparing against pool.
+    try:
+        raw_key = llm.groq_api_key.get_secret_value()
+        start_idx = pool.index(raw_key)
+    except (ValueError, AttributeError):
+        start_idx = _current_key_idx % max(len(pool), 1)  # atomic CPython read
+
+    current_key_idx = start_idx
+
+    model = os.getenv("GROQ_MODEL", "llama3-70b-8192")
+    temperature = llm.temperature  # preserve caller's temperature
+    active_llm = llm
+
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            resp = active_llm.invoke(messages)
+            # Persist the winning key index for the next pipeline request.
+            # Lock required: two parallel branches (Sigma, KQL) can both
+            # succeed near-simultaneously and write this global from separate
+            # threads. Without the lock the later write clobbers the earlier
+            # one silently (lost update). The lock is uncontended on the fast
+            # path (no rate limiting) so the overhead is negligible.
+            with _key_idx_lock:
+                _current_key_idx = current_key_idx
+            return resp
+        except Exception as exc:
+            exc_str = str(exc)
+            # Detect Groq 429 / rate-limit errors
+            is_rate_limit = (
+                "rate_limit_exceeded" in exc_str
+                or "RateLimitError" in type(exc).__name__
+                or ("429" in exc_str and "rate" in exc_str.lower())
+            )
+            if not is_rate_limit:
+                raise  # non-recoverable — propagate immediately
+
+            last_exc = exc
+
+            # ── Strategy 1: rotate to the next available API key ─────────────
+            next_key_idx = (current_key_idx + 1) % max(len(pool), 1)
+            if next_key_idx != start_idx and len(pool) > 1:
+                current_key_idx = next_key_idx
+                active_llm = ChatGroq(
+                    api_key=pool[current_key_idx],
+                    model_name=model,
+                    temperature=temperature,
+                )
+                logger.warning(
+                    "[LLM] Rate limit on key #%d. Rotating to key #%d (attempt %d/%d).",
+                    (current_key_idx - 1) % len(pool) + 1, current_key_idx + 1,
+                    attempt + 1, max_attempts,
+                )
+                continue  # retry immediately with the new key — no sleep needed
+
+            # ── Strategy 2: all keys exhausted — sleep using Retry-After ─────
+            # Primary: parse the server-suggested wait time, e.g.
+            #   "Please try again in 8.85s."
+            # Fallback: 20 s if the error body has an unexpected format
+            # (proxy timeout, future Groq schema change, etc.).
+            _FALLBACK_WAIT = 20.0
+            wait_s: float = _FALLBACK_WAIT
+            retry_match = re.search(r"try again in ([\d.]+)s", exc_str)
+            if retry_match:
+                wait_s = min(float(retry_match.group(1)) + 2.0, _RATE_LIMIT_WAIT_CAP)
+            # Add ±jitter to reduce thundering-herd when Sigma and KQL
+            # back off simultaneously after hitting the same TPM ceiling.
+            jitter = random.uniform(-_RATE_LIMIT_JITTER, _RATE_LIMIT_JITTER)
+            wait_s = max(1.0, wait_s + jitter)
+
+            # Guard += with a lock: float read-modify-write is not atomic;
+            # two threads accumulating simultaneously would produce a lost update.
+            with _sleep_total_lock:
+                _rate_limit_sleep_total += wait_s  # tracked for eval honesty
+            logger.warning(
+                "[LLM] All %d key(s) rate-limited (attempt %d/%d). "
+                "Sleeping %.1fs (Retry-After%s).",
+                len(pool), attempt + 1, max_attempts, wait_s,
+                "=parsed" if retry_match else "=fallback",
+            )
+            time.sleep(wait_s)
+
+    # All attempts exhausted across all keys
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +507,7 @@ def extract_threat_intel(state: ThreatIntelState) -> ThreatIntelState:
             ),
         ]
 
-        response = llm.invoke(messages)
+        response = _llm_invoke_with_backoff(llm, messages)
         raw_response = response.content.strip()
         logger.info("[Node 1] Raw LLM response (first 500 chars): %s", raw_response[:500])
 
@@ -477,7 +672,7 @@ def generate_yaral(state: ThreatIntelState) -> ThreatIntelState:
                 ),
             ]
 
-        response = llm.invoke(messages)
+        response = _llm_invoke_with_backoff(llm, messages)
         draft = val.extract_yaral_from_response(response.content)
         logger.info("[Node 3] ✅ YARA-L draft generated (%d chars).", len(draft))
         return {**state, "yaral_draft": draft}
@@ -666,7 +861,7 @@ def generate_sigma(state: ThreatIntelState) -> ThreatIntelState:
                     ),
                 ]
 
-            response = llm.invoke(messages)
+            response = _llm_invoke_with_backoff(llm, messages)
             sigma_draft = sval.extract_sigma_from_response(response.content)
             is_valid, err = sval.validate_sigma_rule(sigma_draft)
 
@@ -681,7 +876,7 @@ def generate_sigma(state: ThreatIntelState) -> ThreatIntelState:
         except Exception as e:
             last_error = f"LLM call failed: {type(e).__name__}: {e}"
             logger.exception("[Node 3a] ❌ %s", last_error)
-            break
+            break  # _llm_invoke_with_backoff already handled rate-limit retries
 
     # All attempts failed — store whatever draft we have (best effort)
     logger.error("[Node 3a] ❌ Sigma generation exhausted %d attempts.", MAX_SIGMA_RETRIES)
@@ -760,7 +955,7 @@ def generate_kql(state: ThreatIntelState) -> ThreatIntelState:
             ),
         ]
 
-        response = llm.invoke(messages)
+        response = _llm_invoke_with_backoff(llm, messages)
         # Strip markdown fences if present
         kql_raw = response.content.strip()
         fence_match = __import__("re").search(
@@ -863,7 +1058,7 @@ def synthesize_from_logs(state: ThreatIntelState) -> ThreatIntelState:
             ),
         ]
 
-        response = llm.invoke(messages)
+        response = _llm_invoke_with_backoff(llm, messages)
         raw_response = response.content.strip()
         logger.info("[Node 1/ES] Raw LLM response (first 500 chars): %s", raw_response[:500])
 
@@ -1000,14 +1195,27 @@ def _build_graph() -> Any:
                                             ↓
                                            ┘
                                       contextualize_with_rag (Node 2)
-                                            ↓
-                                      generate_yaral (Node 3) ◄─────┐
-                                            ↓                       │
+                                            │
+                              ┌─────────────┴─────────────┐
+                              ▼                           ▼
+                        generate_sigma (Node 3a)   generate_kql (Node 3b)
+                              │    [parallel fan-out]     │
+                              └─────────────┬─────────────┘
+                                            │ (fan-in join)
+                                            ▼
+                                      generate_yaral (Node 3c) ◄───┐
+                                            ↓                      │
                                       validate_yaral (Node 4) ─(fail)┘
                                             ↓ (pass or exhausted)
                                          finalize (Node 5)
                                             ↓
                                            END
+
+    Rate-limit note: extract_threat_intel (Node 1) is the largest single
+    LLM call (~2 500 tokens requested for a dense fixture). Sigma and KQL
+    then fire concurrently against whatever TPM headroom remains. Both nodes
+    now use _llm_invoke_with_backoff, which rotates through the API key pool
+    before sleeping so a rate-limit on one account does not stall the pipeline.
 
     Returns:
         A compiled LangGraph CompiledGraph ready for invocation.
@@ -1142,6 +1350,9 @@ def run_pipeline(text: str) -> ThreatIntelState:
     Raises:
         ValueError: If the input text is empty or whitespace-only.
     """
+    global _rate_limit_sleep_total
+    _rate_limit_sleep_total = 0.0  # reset accumulator for this run
+
     if not text or not text.strip():
         raise ValueError("Input text cannot be empty.")
 
@@ -1180,11 +1391,19 @@ def run_pipeline(text: str) -> ThreatIntelState:
         "retry_count": 0,
         "final_yaral_rule": None,
         "pipeline_error": None,
+        "rate_limit_sleep_s": 0.0,
     }
 
     logger.info("Starting Agentic-CTI text-report pipeline...")
     result: ThreatIntelState = _graph.invoke(initial_state)
-    logger.info("Pipeline finished.")
+    result["rate_limit_sleep_s"] = round(_rate_limit_sleep_total, 2)
+    if _rate_limit_sleep_total > 0:
+        logger.info(
+            "Pipeline finished. Total rate-limit sleep: %.1fs.",
+            _rate_limit_sleep_total,
+        )
+    else:
+        logger.info("Pipeline finished.")
     return result
 
 
@@ -1237,11 +1456,18 @@ def run_pipeline_from_logs(
         "retry_count": 0,
         "final_yaral_rule": None,
         "pipeline_error": None,
+        "rate_limit_sleep_s": 0.0,
     }
 
+    global _rate_limit_sleep_total
+    _rate_limit_sleep_total = 0.0  # reset accumulator for this run
     logger.info("Starting Agentic-CTI ES log-query pipeline... query=%r, index=%s, size=%d", query, index, size)
     result: ThreatIntelState = _graph.invoke(initial_state)
-    logger.info("ES pipeline finished.")
+    result["rate_limit_sleep_s"] = round(_rate_limit_sleep_total, 2)
+    if _rate_limit_sleep_total > 0:
+        logger.info("ES pipeline finished. Total rate-limit sleep: %.1fs.", _rate_limit_sleep_total)
+    else:
+        logger.info("ES pipeline finished.")
     return result
 
 

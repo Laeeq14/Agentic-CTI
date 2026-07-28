@@ -262,7 +262,8 @@ def _evaluate_fixture(
         "fp_count"            : None,   # int (YARA-L)
         "needs_review"        : None,   # bool: any format exceeds 5% FP threshold
         # --- performance ---
-        "latency_seconds"     : None,   # float
+        "latency_seconds"     : None,   # float (wall-clock incl. any rate-limit sleep)
+        "rate_limit_sleep_s"  : None,   # float: seconds slept waiting for rate-limit; 0 = no throttling
         "estimated_cost_usd"  : None,   # float
         # --- raw ---
         "pipeline_result"     : None,
@@ -365,6 +366,8 @@ def _evaluate_fixture(
 
     # Step 6: Latency + cost
     result["latency_seconds"] = elapsed
+    # Capture rate-limit sleep so readers know whether latency was inflated by backoff.
+    result["rate_limit_sleep_s"] = pipeline_out.get("rate_limit_sleep_s", 0.0)
     # Cost estimate: Groq llama-3.3-70b pricing
     #   Input:  ~$0.59 / 1M tokens  ->  ~$0.000000148 / char (1 token ~= 4 chars)
     #   Output: ~$0.79 / 1M tokens  ->  ~$0.000000198 / char
@@ -376,10 +379,12 @@ def _evaluate_fixture(
         (input_chars * 0.000000148) + (output_chars * 0.000000198), 6
     )
 
+    rl_sleep = result["rate_limit_sleep_s"] or 0.0
     review_flag = " [NEEDS_REVIEW]" if needs_review_any else ""
+    rl_flag = f" [RATE_LIMITED +{rl_sleep:.1f}s]" if rl_sleep > 0 else ""
     logger.info(
-        "[%s] Done in %.2fs | ioc_recall=%.2f | ttp_recall=%.2f | yaral_pass=%s | fp_yaral=%s | fp_sigma=%s | fp_kql=%s%s",
-        fid, elapsed, result["ioc_recall"], result["ttp_recall"], result["yaral_first_pass"],
+        "[%s] Done in %.2fs%s | ioc_recall=%.2f | ttp_recall=%.2f | yaral_pass=%s | fp_yaral=%s | fp_sigma=%s | fp_kql=%s%s",
+        fid, elapsed, rl_flag, result["ioc_recall"], result["ttp_recall"], result["yaral_first_pass"],
         f"{result['fp_rate']:.3f}" if result["fp_rate"] is not None else "N/A",
         f"{result['fp_rate_sigma']:.3f}" if result["fp_rate_sigma"] is not None else "N/A",
         f"{result['fp_rate_kql']:.3f}" if result["fp_rate_kql"] is not None else "N/A",
@@ -481,6 +486,13 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
         # Latency + cost
         "mean_latency_seconds"     : _safe_mean([r["latency_seconds"] for r in non_adv
                                                   if r.get("latency_seconds") is not None]),
+        # Total rate-limit sleep accumulated across all fixtures.
+        # Non-zero means mean_latency_seconds is inflated by backoff; subtract
+        # this from total wall time to get "real" inference latency.
+        "total_rate_limit_sleep_s" : round(sum(
+            r["rate_limit_sleep_s"] for r in non_adv
+            if r.get("rate_limit_sleep_s") is not None
+        ), 2),
         "total_estimated_cost_usd" : round(sum(
             r["estimated_cost_usd"] for r in non_adv
             if r.get("estimated_cost_usd") is not None
@@ -577,8 +589,14 @@ def print_report(results: list[dict[str, Any]], agg: dict[str, Any]) -> None:
     # Latency + cost summary
     mean_lat = agg.get("mean_latency_seconds")
     total_cost = agg.get("total_estimated_cost_usd")
+    total_rl_sleep = agg.get("total_rate_limit_sleep_s", 0.0)
     if mean_lat is not None:
-        print(f"  Mean Pipeline Latency      : {mean_lat:.2f}s")
+        rl_note = (
+            f" (incl. {total_rl_sleep:.1f}s rate-limit backoff sleep across run — "
+            f"net inference latency ~{max(mean_lat - total_rl_sleep/max(agg['non_adversarial_fixtures'],1), 0):.2f}s/analysis)"
+            if total_rl_sleep > 0 else ""
+        )
+        print(f"  Mean Pipeline Latency      : {mean_lat:.2f}s{rl_note}")
     if total_cost is not None:
         print(f"  Total Estimated Cost (USD) : ${total_cost:.5f}  "
               f"[~${total_cost/max(agg['non_adversarial_fixtures'],1):.6f}/analysis — est. from char count]")
