@@ -45,7 +45,7 @@ env:
   IOC_F1_THRESHOLD: '0.90'
   GUARD_TPR_THRESHOLD: '1.00'
   # Fixtures to run in the live subset (space-separated IDs)
-  LIVE_FIXTURES: 'F01_apt41_baseline F07_apt28_fancy_bear F21_no_ioc_report F06_adversarial_injection F30_adversarial_role_override'
+  LIVE_FIXTURES: 'F01_apt41_baseline F07_apt28_fancy_bear F21_no_iocs_only_ttps F06_adversarial_injection F30_adversarial_role_override'
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────────
