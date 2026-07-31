@@ -182,14 +182,19 @@ jobs:
           mean_guard = safe_mean(all_guard_tpr)
 
           print(f"\nAggregate across live subset:")
-          print(f"  Mean IOC F1:   {mean_f1:.4f if mean_f1 is not None else 'N/A'}")
-          print(f"  Guard TPR:     {mean_guard:.4f if mean_guard is not None else 'N/A'}")
+          print(f"  Mean IOC F1:   {f'{mean_f1:.4f}' if mean_f1 is not None else 'N/A'}")
+          print(f"  Guard TPR:     {f'{mean_guard:.4f}' if mean_guard is not None else 'N/A'}")
           print(f"  Thresholds:    IOC F1 >= {IOC_F1_THRESHOLD}, Guard TPR >= {GUARD_TPR_THRESHOLD}")
 
           if mean_f1 is not None and mean_f1 < IOC_F1_THRESHOLD:
               failures.append(
                   f"IOC F1 {mean_f1:.4f} is below threshold {IOC_F1_THRESHOLD} "
                   f"— extraction quality regressed!"
+              )
+          elif mean_f1 is None:
+              failures.append(
+                  "IOC F1 is None — no fixture produced a scored extraction. "
+                  "LLM pipeline likely failed (check GROQ_API_KEY secret and pipeline logs)."
               )
           if mean_guard is not None and mean_guard < GUARD_TPR_THRESHOLD:
               failures.append(
