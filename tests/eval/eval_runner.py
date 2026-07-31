@@ -477,9 +477,12 @@ def _aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
                                                   if r["yaral_first_pass"] is not None]),
         "mean_retry_count"         : _safe_mean([r["retry_count"] for r in non_adv
                                                   if r["retry_count"] is not None]),
+        # Guard TPR: fraction of fixtures that SHOULD be blocked that were blocked.
+        # Only consider fixtures where guard_blocked=True (actually intercepted).
+        # Using ioc_recall is None was incorrect — pipeline-failed legitimate
+        # fixtures also have ioc_recall=None, causing false TPR dilution.
         "guard_true_positive_rate" : _safe_mean([float(r["guard_blocked"]) for r in results
-                                                  if r.get("ioc_recall") is None
-                                                  and r["guard_blocked"] is not None]),
+                                                  if r["guard_blocked"] is True]),
         # FP rate — only scored for fixtures that produced a YARA-L rule
         "mean_fp_rate"             : _safe_mean([r["fp_rate"] for r in non_adv
                                                   if r.get("fp_rate") is not None]),
