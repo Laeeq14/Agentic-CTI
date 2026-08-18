@@ -521,6 +521,42 @@ def _llm_invoke_with_backoff(llm: ChatGroq, messages: list, max_attempts: int = 
 
 
 # ---------------------------------------------------------------------------
+# Response content normalizer
+# ---------------------------------------------------------------------------
+
+def _get_response_text(response) -> str:
+    """
+    Safely extract the text content from an LLM response.
+
+    Different LangChain providers return ``response.content`` in different
+    formats:
+      - ChatGroq / ChatOpenAI: plain string
+      - ChatGoogleGenerativeAI (Gemini 3.5 Flash with thinking enabled):
+        a list of part-dicts, e.g.
+          [{'type': 'thinking', 'thinking': '...'}, {'type': 'text', 'text': '...'}]
+        or simply [{'type': 'text', 'text': '...'}]
+
+    This helper normalises both into a single string so the rest of the
+    pipeline can call ``.strip()`` and ``json.loads()`` safely.
+    """
+    content = response.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                # Gemini thinking blocks: skip 'thinking' parts, keep 'text'
+                text = part.get("text") or part.get("content", "")
+                if text:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
+# ---------------------------------------------------------------------------
 # JSON extraction helper
 # ---------------------------------------------------------------------------
 
@@ -692,7 +728,7 @@ def extract_threat_intel(state: ThreatIntelState) -> ThreatIntelState:
         ]
 
         response = _llm_invoke_with_backoff(llm, messages)
-        raw_response = response.content.strip()
+        raw_response = _get_response_text(response).strip()
         logger.info("[Node 1] Raw LLM response (first 500 chars): %s", raw_response[:500])
 
         parsed = _extract_json_from_llm_response(raw_response)
@@ -857,7 +893,7 @@ def generate_yaral(state: ThreatIntelState) -> ThreatIntelState:
             ]
 
         response = _llm_invoke_with_backoff(llm, messages)
-        draft = val.extract_yaral_from_response(response.content)
+        draft = val.extract_yaral_from_response(_get_response_text(response))
         logger.info("[Node 3] ✅ YARA-L draft generated (%d chars).", len(draft))
         return {**state, "yaral_draft": draft}
 
@@ -1046,7 +1082,7 @@ def generate_sigma(state: ThreatIntelState) -> ThreatIntelState:
                 ]
 
             response = _llm_invoke_with_backoff(llm, messages)
-            sigma_draft = sval.extract_sigma_from_response(response.content)
+            sigma_draft = sval.extract_sigma_from_response(_get_response_text(response))
             is_valid, err = sval.validate_sigma_rule(sigma_draft)
 
             if is_valid:
@@ -1141,7 +1177,7 @@ def generate_kql(state: ThreatIntelState) -> ThreatIntelState:
 
         response = _llm_invoke_with_backoff(llm, messages)
         # Strip markdown fences if present
-        kql_raw = response.content.strip()
+        kql_raw = _get_response_text(response).strip()
         fence_match = __import__("re").search(
             r"```(?:kql|kusto|text|plaintext)?\s*\n?(.*?)```", kql_raw, __import__("re").DOTALL | __import__("re").IGNORECASE
         )
@@ -1243,7 +1279,7 @@ def synthesize_from_logs(state: ThreatIntelState) -> ThreatIntelState:
         ]
 
         response = _llm_invoke_with_backoff(llm, messages)
-        raw_response = response.content.strip()
+        raw_response = _get_response_text(response).strip()
         logger.info("[Node 1/ES] Raw LLM response (first 500 chars): %s", raw_response[:500])
 
         parsed = _extract_json_from_llm_response(raw_response)
