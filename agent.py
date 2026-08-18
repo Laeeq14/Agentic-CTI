@@ -220,7 +220,7 @@ def _get_llm(temperature: float = 0.1):
         api_key = os.getenv("CEREBRAS_API_KEY")
         if not api_key:
             raise EnvironmentError("CEREBRAS_API_KEY not set.")
-        model = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+        model = os.getenv("CEREBRAS_MODEL", "openai/gpt-oss-120b")
         logger.info("[LLM] Provider=Cerebras model=%s", model)
         return ChatOpenAI(
             api_key=api_key,
@@ -233,7 +233,7 @@ def _get_llm(temperature: float = 0.1):
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise EnvironmentError("OPENROUTER_API_KEY not set.")
-        model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+        model = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
         logger.info("[LLM] Provider=OpenRouter model=%s", model)
         return ChatOpenAI(
             api_key=api_key,
