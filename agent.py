@@ -239,7 +239,7 @@ def _get_llm(temperature: float = 0.1):
             "No LLM API key found. Set GROQ_API_KEY, OPENROUTER_API_KEY, "
             "or CEREBRAS_API_KEY in your .env file."
         )
-    model = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     logger.info("[LLM] Provider=Groq model=%s", model)
     return ChatGroq(api_key=api_key, model_name=model, temperature=temperature)
 
@@ -390,7 +390,7 @@ def _llm_invoke_with_backoff(llm: ChatGroq, messages: list, max_attempts: int = 
 
     current_key_idx = start_idx
 
-    model = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")  # only used for Groq key rotation
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")  # only used for Groq key rotation
     temperature = llm.temperature  # preserve caller's temperature
     active_llm = llm
 
