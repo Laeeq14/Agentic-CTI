@@ -32,8 +32,8 @@ st.set_page_config(
 from agent import ThreatIntelReport, run_pipeline
 
 # Mirror of agent.MAX_INPUT_CHARS — max chars sent to the LLM.
-# 100k chars ≈ 25k tokens, well within llama-3.3-70b's 128k token window.
-# See agent.py for full context math and the map-reduce backlog note.
+# Restored to 100k: Cerebras and OpenRouter both support 128k+ token context.
+# Groq free-tier users may still hit 413 errors; see agent.py for details.
 MAX_INPUT_CHARS = 100_000
 import vector_store as vs
 from qdrant_client import QdrantClient

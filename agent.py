@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field, ValidationError
@@ -58,16 +59,13 @@ MAX_RETRIES = 3
 # Maximum characters of raw text sent to the LLM (extraction step only).
 #
 # Context math:
-#   Groq llama-3.3-70b context window ≈ 128k tokens ≈ 500k characters
-#   1 token ≈ 4 characters
-#   100k chars ≈ 25k tokens — leaves ~100k tokens for system prompt + JSON output
+#   Cerebras / OpenRouter free tier  → 128k token context → ~500k chars headroom.
+#   Groq free "on_demand" tier       → 8,000 TPM per request (≈20k chars safe).
 #
-# 100k covers the vast majority of real-world threat advisories, including
-# full-length vendor reports with IOC appendices (e.g. 45k-char Arid Viper PDF).
-#
-# For documents beyond 100k chars, the correct solution is a Map-Reduce
-# chunking approach (split → extract per chunk → merge/dedupe) rather than
-# raising this limit further. Add to backlog: LangGraph Map-Reduce for PDFs.
+# 100k chars covers the vast majority of real-world threat advisories.
+# If you are on Groq free tier and hit 413 errors, either:
+#   a) Upgrade to Groq Dev Tier, or
+#   b) Add OPENROUTER_API_KEY or CEREBRAS_API_KEY — both have 128k+ context.
 MAX_INPUT_CHARS = 100_000
 
 
@@ -166,29 +164,97 @@ class ThreatIntelState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
+# Provider detection — Cerebras → OpenRouter → Groq (first key found wins)
+# ---------------------------------------------------------------------------
+
+PROVIDER_CEREBRAS    = "cerebras"
+PROVIDER_OPENROUTER  = "openrouter"
+PROVIDER_GROQ        = "groq"
+
+
+def _detect_provider() -> str:
+    """
+    Choose an LLM provider based on which API key is present.
+
+    Priority:
+      1. Cerebras   — blazing-fast inference, 128k context, free tier.
+      2. OpenRouter  — free tier access to many models, 128k+ context.
+      3. Groq        — default; free tier limited to 8k TPM per request.
+
+    Override by setting LLM_PROVIDER=groq|openrouter|cerebras explicitly.
+    """
+    explicit = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if explicit in (PROVIDER_CEREBRAS, PROVIDER_OPENROUTER, PROVIDER_GROQ):
+        return explicit
+    if os.getenv("CEREBRAS_API_KEY"):
+        return PROVIDER_CEREBRAS
+    if os.getenv("OPENROUTER_API_KEY"):
+        return PROVIDER_OPENROUTER
+    return PROVIDER_GROQ
+
+
+# ---------------------------------------------------------------------------
 # LLM factory
 # ---------------------------------------------------------------------------
 
-def _get_llm(temperature: float = 0.1) -> ChatGroq:
+def _get_llm(temperature: float = 0.1):
     """
-    Instantiate a Groq-backed Llama-3 LLM.
+    Instantiate the configured LLM.
+
+    Provider priority: Cerebras → OpenRouter → Groq.
+    Override with LLM_PROVIDER env var.
 
     Args:
         temperature: Sampling temperature. Lower = more deterministic.
-                     Use ~0.1 for extraction, ~0.3 for creative YARA-L generation.
+                     Use ~0.1 for extraction, ~0.3 for creative generation.
 
     Returns:
-        A configured ChatGroq instance.
+        A LangChain chat model (ChatGroq or ChatOpenAI depending on provider).
 
     Raises:
-        EnvironmentError: If GROQ_API_KEY is not set.
+        EnvironmentError: If no API key is found for the selected provider.
     """
+    provider = _detect_provider()
+
+    if provider == PROVIDER_CEREBRAS:
+        api_key = os.getenv("CEREBRAS_API_KEY")
+        if not api_key:
+            raise EnvironmentError("CEREBRAS_API_KEY not set.")
+        model = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
+        logger.info("[LLM] Provider=Cerebras model=%s", model)
+        return ChatOpenAI(
+            api_key=api_key,
+            base_url="https://api.cerebras.ai/v1",
+            model=model,
+            temperature=temperature,
+        )
+
+    if provider == PROVIDER_OPENROUTER:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise EnvironmentError("OPENROUTER_API_KEY not set.")
+        model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+        logger.info("[LLM] Provider=OpenRouter model=%s", model)
+        return ChatOpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            model=model,
+            temperature=temperature,
+            default_headers={
+                "HTTP-Referer": "https://github.com/Laeeq14/Agentic-CTI",
+                "X-Title": "Agentic-CTI",
+            },
+        )
+
+    # Groq (default)
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise EnvironmentError(
-            "GROQ_API_KEY not found. Set it in your .env file or environment."
+            "No LLM API key found. Set GROQ_API_KEY, OPENROUTER_API_KEY, "
+            "or CEREBRAS_API_KEY in your .env file."
         )
     model = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
+    logger.info("[LLM] Provider=Groq model=%s", model)
     return ChatGroq(api_key=api_key, model_name=model, temperature=temperature)
 
 
@@ -289,20 +355,27 @@ def _llm_invoke_with_backoff(llm: ChatGroq, messages: list, max_attempts: int = 
     # _current_key_idx here are CPython-atomic and need no lock.
     global _rate_limit_sleep_total
 
-    pool = _get_key_pool()
+    # Key-rotation is a Groq-specific feature (multiple GROQ_API_KEY_* accounts).
+    # OpenRouter and Cerebras use a single key — skip rotation for those providers.
+    is_groq = isinstance(llm, ChatGroq)
+
+    pool = _get_key_pool() if is_groq else []
     # Snapshot the current key index once at entry.  This is a read-only
     # snapshot: the branch never writes _current_key_idx mid-flight.
     # The write happens inside the lock only on success (see below).
     # groq_api_key is a Pydantic SecretStr; unwrap before comparing against pool.
-    try:
-        raw_key = llm.groq_api_key.get_secret_value()
-        start_idx = pool.index(raw_key)
-    except (ValueError, AttributeError):
-        start_idx = _current_key_idx % max(len(pool), 1)  # atomic CPython read
+    if is_groq:
+        try:
+            raw_key = llm.groq_api_key.get_secret_value()
+            start_idx = pool.index(raw_key)
+        except (ValueError, AttributeError):
+            start_idx = _current_key_idx % max(len(pool), 1)  # atomic CPython read
+    else:
+        start_idx = 0
 
     current_key_idx = start_idx
 
-    model = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
+    model = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")  # only used for Groq key rotation
     temperature = llm.temperature  # preserve caller's temperature
     active_llm = llm
 
@@ -332,21 +405,22 @@ def _llm_invoke_with_backoff(llm: ChatGroq, messages: list, max_attempts: int = 
 
             last_exc = exc
 
-            # ── Strategy 1: rotate to the next available API key ─────────────
-            next_key_idx = (current_key_idx + 1) % max(len(pool), 1)
-            if next_key_idx != start_idx and len(pool) > 1:
-                current_key_idx = next_key_idx
-                active_llm = ChatGroq(
-                    api_key=pool[current_key_idx],
-                    model_name=model,
-                    temperature=temperature,
-                )
-                logger.warning(
-                    "[LLM] Rate limit on key #%d. Rotating to key #%d (attempt %d/%d).",
-                    (current_key_idx - 1) % len(pool) + 1, current_key_idx + 1,
-                    attempt + 1, max_attempts,
-                )
-                continue  # retry immediately with the new key — no sleep needed
+            # ── Strategy 1: rotate to the next available API key (Groq only) ───────
+            if is_groq:
+                next_key_idx = (current_key_idx + 1) % max(len(pool), 1)
+                if next_key_idx != start_idx and len(pool) > 1:
+                    current_key_idx = next_key_idx
+                    active_llm = ChatGroq(
+                        api_key=pool[current_key_idx],
+                        model_name=model,
+                        temperature=temperature,
+                    )
+                    logger.warning(
+                        "[LLM] Rate limit on key #%d. Rotating to key #%d (attempt %d/%d).",
+                        (current_key_idx - 1) % len(pool) + 1, current_key_idx + 1,
+                        attempt + 1, max_attempts,
+                    )
+                    continue  # retry immediately with the new key — no sleep needed
 
             # ── Strategy 2: all keys exhausted — sleep using Retry-After ─────
             # Primary: parse the server-suggested wait time, e.g.
