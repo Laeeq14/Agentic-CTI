@@ -129,6 +129,10 @@ jobs:
       - name: Run live eval subset
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Pin to the non-thinking Llama model. The agent.py default falls back
+          # to qwen/qwen3.6-27b (a reasoning model) which emits <think>...</think>
+          # blocks and breaks JSON extraction when GROQ_MODEL is not set.
+          GROQ_MODEL: llama-3.3-70b-versatile
         run: |
           set -e
           echo "Running live eval on fixtures: $LIVE_FIXTURES"

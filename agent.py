@@ -387,7 +387,9 @@ def _extract_json_from_llm_response(raw: str) -> dict:
     """
     Robustly extract a JSON object from an LLM response string.
 
-    Tries three strategies in order:
+    Tries four strategies in order:
+      0. Strip <think>...</think> reasoning blocks emitted by thinking models
+         (Qwen3, DeepSeek-R1, etc.) before any other processing.
       1. Direct json.loads() — for well-behaved responses.
       2. Strip markdown code fences (```json ... ```) and retry.
       3. Regex search for the first {...} block in the string.
@@ -402,6 +404,17 @@ def _extract_json_from_llm_response(raw: str) -> dict:
         ValueError: If no valid JSON object can be found.
     """
     text = raw.strip()
+
+    # Strategy 0: strip <think>...</think> blocks emitted by reasoning/thinking
+    # models (Qwen3-27b, DeepSeek-R1, etc.).  These models wrap their chain-of-
+    # thought in <think> tags before producing the actual output.  Without this
+    # step, Strategy 3's brace search latches onto a '{' inside the think block
+    # (e.g. from the JSON schema example in the system prompt) rather than the
+    # real output JSON, causing all non-adversarial fixtures to fail with
+    # "No valid JSON object found".
+    think_stripped = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE).strip()
+    if think_stripped:  # only use stripped version if something remains
+        text = think_stripped
 
     # Strategy 1: direct parse
     try:
