@@ -225,7 +225,7 @@ def _get_llm(temperature: float = 0.1):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise EnvironmentError("GEMINI_API_KEY not set.")
-        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
         logger.info("[LLM] Provider=Gemini model=%s", model)
         return ChatGoogleGenerativeAI(
             model=model,
