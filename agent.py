@@ -265,6 +265,7 @@ def _get_openrouter_llm(temperature: float = 0.1) -> ChatOpenAI | None:
         base_url="https://openrouter.ai/api/v1",
         model=model,
         temperature=temperature,
+        max_tokens=16384,   # request generous output budget for large JSON
         default_headers={
             "HTTP-Referer": "https://github.com/Laeeq14/Agentic-CTI",
             "X-Title": "Agentic-CTI",
@@ -556,6 +557,36 @@ def _extract_json_from_llm_response(raw: str) -> dict:
     if brace_match:
         try:
             return json.loads(brace_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 4: repair truncated JSON
+    # The model hit its output-token limit mid-stream, leaving an unclosed JSON
+    # object (e.g. a long malware_families array cut off before the closing ]).
+    # We attempt to close any open brackets/braces so json.loads can succeed.
+    # Only values already emitted are kept; nothing is fabricated.
+    brace_start = text.find("{")
+    if brace_start != -1:
+        partial = text[brace_start:].rstrip()
+        # Remove any trailing incomplete token (unterminated string or comma)
+        partial = re.sub(r',\s*$', '', partial)          # trailing comma
+        partial = re.sub(r',\s*"[^"]*$', '', partial)   # trailing partial key
+        partial = re.sub(r':\s*"[^"]*$', '', partial)   # trailing partial value string
+        partial = re.sub(r':\s*\[[^\]]*$', ': []', partial)  # truncated array → empty
+        # Count open brackets/braces and close them
+        depth_brace  = partial.count('{') - partial.count('}')
+        depth_bracket = partial.count('[') - partial.count(']')
+        closing = ']' * max(depth_bracket, 0) + '}' * max(depth_brace, 0)
+        repaired = partial + closing
+        try:
+            parsed = json.loads(repaired)
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[JSON] Response was truncated mid-stream; repaired %d open bracket(s). "
+                "Some list values may be incomplete.",
+                max(depth_bracket, 0) + max(depth_brace, 0),
+            )
+            return parsed
         except json.JSONDecodeError:
             pass
 
