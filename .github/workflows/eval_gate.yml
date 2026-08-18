@@ -132,7 +132,7 @@ jobs:
           # Pin to the non-thinking Llama model. The agent.py default falls back
           # to qwen/qwen3.6-27b (a reasoning model) which emits <think>...</think>
           # blocks and breaks JSON extraction when GROQ_MODEL is not set.
-          GROQ_MODEL: llama-3.3-70b-versatile
+          GROQ_MODEL: qwen/qwen3-27b
         run: |
           set -e
           echo "Running live eval on fixtures: $LIVE_FIXTURES"
