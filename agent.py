@@ -188,7 +188,7 @@ def _get_llm(temperature: float = 0.1) -> ChatGroq:
         raise EnvironmentError(
             "GROQ_API_KEY not found. Set it in your .env file or environment."
         )
-    model = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     return ChatGroq(api_key=api_key, model_name=model, temperature=temperature)
 
 
@@ -302,7 +302,7 @@ def _llm_invoke_with_backoff(llm: ChatGroq, messages: list, max_attempts: int = 
 
     current_key_idx = start_idx
 
-    model = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     temperature = llm.temperature  # preserve caller's temperature
     active_llm = llm
 
