@@ -220,7 +220,7 @@ def _get_llm(temperature: float = 0.1):
         api_key = os.getenv("CEREBRAS_API_KEY")
         if not api_key:
             raise EnvironmentError("CEREBRAS_API_KEY not set.")
-        model = os.getenv("CEREBRAS_MODEL", "openai/gpt-oss-120b")
+        model = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")  # free tier: 8k ctx, 1M tokens/day
         logger.info("[LLM] Provider=Cerebras model=%s", model)
         return ChatOpenAI(
             api_key=api_key,
@@ -230,21 +230,7 @@ def _get_llm(temperature: float = 0.1):
         )
 
     if provider == PROVIDER_OPENROUTER:
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        if not api_key:
-            raise EnvironmentError("OPENROUTER_API_KEY not set.")
-        model = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-        logger.info("[LLM] Provider=OpenRouter model=%s", model)
-        return ChatOpenAI(
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1",
-            model=model,
-            temperature=temperature,
-            default_headers={
-                "HTTP-Referer": "https://github.com/Laeeq14/Agentic-CTI",
-                "X-Title": "Agentic-CTI",
-            },
-        )
+        return _get_openrouter_llm(temperature)
 
     # Groq (default)
     api_key = os.getenv("GROQ_API_KEY")
@@ -256,6 +242,34 @@ def _get_llm(temperature: float = 0.1):
     model = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b")
     logger.info("[LLM] Provider=Groq model=%s", model)
     return ChatGroq(api_key=api_key, model_name=model, temperature=temperature)
+
+
+def _get_openrouter_llm(temperature: float = 0.1) -> ChatOpenAI | None:
+    """
+    Build a ChatOpenAI pointed at OpenRouter's free router.
+
+    The model ``openrouter/free`` is a special OpenRouter meta-model that
+    intelligently routes to whichever high-quality free model has capacity
+    (GPT-OSS-120B accounts for ~13% of that pool). Supports up to 1M token
+    context on some models in the pool.
+
+    Returns None if OPENROUTER_API_KEY is not configured.
+    """
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+    logger.info("[LLM] Provider=OpenRouter model=%s", model)
+    return ChatOpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        model=model,
+        temperature=temperature,
+        default_headers={
+            "HTTP-Referer": "https://github.com/Laeeq14/Agentic-CTI",
+            "X-Title": "Agentic-CTI",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +418,39 @@ def _llm_invoke_with_backoff(llm: ChatGroq, messages: list, max_attempts: int = 
                 raise  # non-recoverable — propagate immediately
 
             last_exc = exc
+
+            # ── Strategy 0: Cerebras context/payment error → fallback to OpenRouter ──
+            # Cerebras free tier caps context at 8k tokens. If the document is
+            # too large (413/402/context_length_exceeded), transparently switch
+            # to the OpenRouter free router which supports up to 1M token context.
+            is_cerebras = (
+                isinstance(active_llm, ChatOpenAI)
+                and not is_groq
+                and "api.cerebras.ai" in str(getattr(active_llm, "openai_api_base", ""))
+                    or (hasattr(active_llm, "base_url")
+                        and "cerebras" in str(active_llm.base_url))
+            )
+            exc_str_lower = exc_str.lower()
+            is_context_error = (
+                "402" in exc_str
+                or "413" in exc_str
+                or "payment_required" in exc_str_lower
+                or "context_length_exceeded" in exc_str_lower
+                or "context window" in exc_str_lower
+                or "too large" in exc_str_lower
+                or "max_tokens" in exc_str_lower
+            )
+            if is_cerebras and is_context_error:
+                fallback = _get_openrouter_llm(temperature)
+                if fallback is not None:
+                    logger.warning(
+                        "[LLM] Cerebras context/payment limit hit — failing over to OpenRouter "
+                        "(attempt %d/%d).",
+                        attempt + 1, max_attempts,
+                    )
+                    active_llm = fallback
+                    continue  # retry with OpenRouter immediately
+                raise  # no fallback available
 
             # ── Strategy 1: rotate to the next available API key (Groq only) ───────
             if is_groq:
