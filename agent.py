@@ -220,7 +220,7 @@ def _get_llm(temperature: float = 0.1):
         api_key = os.getenv("CEREBRAS_API_KEY")
         if not api_key:
             raise EnvironmentError("CEREBRAS_API_KEY not set.")
-        model = os.getenv("CEREBRAS_MODEL", "llama-3.3-70b")
+        model = os.getenv("CEREBRAS_MODEL", "qwen/qwen3.6-27b")
         logger.info("[LLM] Provider=Cerebras model=%s", model)
         return ChatOpenAI(
             api_key=api_key,
