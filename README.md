@@ -8,7 +8,7 @@ This is not an LLM wrapper. It is an end-to-end SOC automation platform that acc
 
 ## 📈 Benchmark Results — 30-Fixture Live Evaluation
 
-*Verified 2026-07-08 · Groq `llama-3.3-70b-versatile` · 30 fixtures across 3 tiers (Tier 1: baselines, Tier 2: APT groups, Tier 3: edge cases)*
+*Verified 2026-07-08 · Groq `meta-llama/llama-4-scout-17b-16e-instruct` · 30 fixtures across 3 tiers (Tier 1: baselines, Tier 2: APT groups, Tier 3: edge cases)*
 
 | Metric | Score |
 |---|---|
@@ -372,7 +372,7 @@ Agentic-CTI/
 
 ## 🤖 Model
 
-- **LLM:** Groq `llama-3.3-70b-versatile` — extraction, YARA-L generation, log synthesis
+- **LLM:** Groq `meta-llama/llama-4-scout-17b-16e-instruct` — extraction, YARA-L generation, log synthesis
 - **Embeddings:** `all-MiniLM-L6-v2` (sentence-transformers, local, no API key)
 - **Vector DB:** Qdrant (cosine similarity, persistent local volume)
 - **Log DB:** Elasticsearch 8.13 (single-node for dev, cluster-ready for prod)
