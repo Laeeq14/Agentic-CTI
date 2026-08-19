@@ -797,17 +797,17 @@ def main() -> None:
     <div class="cti-header">
       <div class="cti-header-left">
         <h1>AGENTIC-CTI</h1>
-        <p>DETECTION-AS-CODE PIPELINE // LangGraph + Groq/Llama-3.3 // Qdrant RAG // YARA-L 2.0 · Sigma · KQL</p>
+        <p>DETECTION-AS-CODE PIPELINE // LangGraph + gemini-3.5-flash/Google Gemini // Qdrant RAG // YARA-L 2.0 · Sigma · KQL</p>
       </div>
       <div class="cti-status-bar">
         <div class="cti-status-item">
           <div class="label">Engine</div>
-          <div class="value">LLAMA-3.3-70B</div>
+          <div class="value">GEMINI-3.5-FLASH</div>
         </div>
         <div class="cti-status-divider"></div>
         <div class="cti-status-item">
           <div class="label">Provider</div>
-          <div class="value">GROQ</div>
+          <div class="value">GEMINI</div>
         </div>
         <div class="cti-status-divider"></div>
         <div class="cti-status-item">
