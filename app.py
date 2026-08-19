@@ -15,6 +15,31 @@ import json
 import logging
 import os
 
+
+def _llm_provider_display() -> str:
+    """Return a human-readable provider name for the pipeline metadata panel."""
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if provider == "gemini" or os.getenv("GEMINI_API_KEY"):
+        return "Google Gemini"
+    if provider == "cerebras" or os.getenv("CEREBRAS_API_KEY"):
+        return "Cerebras"
+    if provider == "openrouter" or os.getenv("OPENROUTER_API_KEY"):
+        return "OpenRouter"
+    return "Groq API"
+
+
+def _llm_model_display() -> str:
+    """Return the active model ID for the pipeline metadata panel."""
+    provider = os.getenv("LLM_PROVIDER", "").strip().lower()
+    if provider == "gemini" or (not provider and os.getenv("GEMINI_API_KEY")):
+        return os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+    if provider == "cerebras" or (not provider and os.getenv("CEREBRAS_API_KEY")):
+        return os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+    if provider == "openrouter" or (not provider and os.getenv("OPENROUTER_API_KEY")):
+        return os.getenv("OPENROUTER_MODEL", "openrouter/free")
+    return os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+
 import streamlit as st
 
 # ---------------------------------------------------------------------------
@@ -906,7 +931,7 @@ def main() -> None:
                     icon="⚠",
                 )
             st.write("▸ Node 0 — Prompt injection scan…")
-            st.write("▸ Node 1 — Extracting structured intelligence via Llama-3.3…")
+            st.write("▸ Node 1 — Extracting structured intelligence via LLM…")
             try:
                 import time as _time
                 _t0 = _time.perf_counter()
@@ -1277,11 +1302,11 @@ def main() -> None:
                 <div class="meta-grid">
                   <div class="meta-item">
                     <div class="meta-label">LLM Model</div>
-                    <div class="meta-value" style="font-size:0.85rem;">Llama-3.3-70B</div>
+                    <div class="meta-value" style="font-size:0.85rem;">{_llm_model_display()}</div>
                   </div>
                   <div class="meta-item">
                     <div class="meta-label">Provider</div>
-                    <div class="meta-value" style="font-size:0.85rem;">Groq API</div>
+                    <div class="meta-value" style="font-size:0.85rem;">{_llm_provider_display()}</div>
                   </div>
                   <div class="meta-item">
                     <div class="meta-label">YARA-L Retries</div>
