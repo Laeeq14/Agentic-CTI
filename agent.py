@@ -439,7 +439,57 @@ def _llm_invoke_with_backoff(llm: ChatGroq, messages: list, max_attempts: int = 
 
             last_exc = exc
 
-            # ── Strategy 0: Cerebras context/payment error → fallback to OpenRouter ──
+            # ── Strategy 0a: Gemini daily quota exhausted → OpenRouter fallback ────
+            # Gemini free tier caps at 20 RPD per model. When RESOURCE_EXHAUSTED
+            # hits a *daily* quota ID (not per-minute), sleeping is useless —
+            # the quota won't reset for hours. Immediately fall over to OpenRouter
+            # (which routes through Google models with a separate quota pool).
+            # Detection: "RESOURCE_EXHAUSTED" + daily quota dimension.
+            is_gemini = type(active_llm).__name__ == "ChatGoogleGenerativeAI"
+            is_daily_quota = (
+                "RESOURCE_EXHAUSTED" in exc_str
+                and (
+                    "PerDay" in exc_str
+                    or "per_day" in exc_str.lower()
+                    or "GenerateRequestsPerDay" in exc_str
+                    or "free_tier" in exc_str.lower()
+                )
+            )
+
+            if is_gemini and is_daily_quota:
+                # First try GEMINI_FALLBACK_MODEL (e.g. gemini-3.5-flash-lite)
+                # which has a separate daily quota from the primary model.
+                fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+                current_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+                api_key = os.getenv("GEMINI_API_KEY", "")
+                if fallback_model and fallback_model != current_model and api_key:
+                    logger.warning(
+                        "[LLM] Gemini daily quota exhausted for '%s'. "
+                        "Switching to GEMINI_FALLBACK_MODEL='%s' (attempt %d/%d).",
+                        current_model, fallback_model, attempt + 1, max_attempts,
+                    )
+                    active_llm = ChatGoogleGenerativeAI(
+                        model=fallback_model,
+                        google_api_key=api_key,
+                        temperature=temperature,
+                    )
+                    continue  # retry immediately with fallback model
+
+                # No within-Gemini fallback available — try OpenRouter next.
+                openrouter_fallback = _get_openrouter_llm(temperature)
+                if openrouter_fallback is not None:
+                    logger.warning(
+                        "[LLM] Gemini daily quota exhausted and no GEMINI_FALLBACK_MODEL set. "
+                        "Failing over to OpenRouter (attempt %d/%d).",
+                        attempt + 1, max_attempts,
+                    )
+                    active_llm = openrouter_fallback
+                    continue  # retry immediately with OpenRouter
+
+                # No fallbacks at all — re-raise so the node captures the error.
+                raise
+
+            # ── Strategy 0b: Cerebras context/payment error → fallback to OpenRouter ──
             # Cerebras free tier caps context at 8k tokens. If the document is
             # too large (413/402/context_length_exceeded), transparently switch
             # to the OpenRouter free router which supports up to 1M token context.

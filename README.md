@@ -1,6 +1,6 @@
 # Agentic-CTI 🛡️
 
-**A fully containerized, agentic threat triage engine powered by LangGraph, Elasticsearch, and Groq Llama-3.3-70b.**
+**A fully containerized, agentic threat triage engine powered by LangGraph, Elasticsearch, and a multi-provider LLM stack (Gemini → OpenRouter → Groq → Cerebras).**
 
 This is not an LLM wrapper. It is an end-to-end SOC automation platform that accepts raw threat advisories *and* live Elasticsearch log streams, and converts both into validated detection rules in three formats — YARA-L 2.0 (Google SecOps), Sigma (SIEM-agnostic), and KQL (Microsoft Sentinel) — with a quantifiable extraction F1 score across a 30-fixture benchmark suite, false-positive rate measurement against a 125-event benign traffic dataset, per-run latency and cost tracking, and a MITRE ATT&CK Navigator layer export.
 
@@ -9,6 +9,7 @@ This is not an LLM wrapper. It is an end-to-end SOC automation platform that acc
 ## 📈 Benchmark Results — 30-Fixture Live Evaluation
 
 *Verified 2026-07-08 · Groq `meta-llama/llama-4-scout-17b-16e-instruct` · 30 fixtures across 3 tiers (Tier 1: baselines, Tier 2: APT groups, Tier 3: edge cases)*
+> ⚠️ Benchmark was run on `llama-4-scout-17b-16e-instruct` (Groq). Current active provider is **Gemini `gemini-3.5-flash`** — re-run in progress.
 
 | Metric | Score |
 |---|---|
@@ -83,7 +84,7 @@ This is not an LLM wrapper. It is an end-to-end SOC automation platform that acc
                          │  [Node 3a] Sigma   [Node 3b] KQL                   │
                          │  (SIEM-agnostic)  (Microsoft Sentinel)              │
                          │       ↓              ↓ (join)                       │
-                         │  [Node 3c] YARA-L 2.0 Generation (Llama-3.3-70b)  │
+                         │  [Node 3c] YARA-L 2.0 Generation (LLM)              │
                          │       ↓                                             │
                          │  [Node 4] Structural Validator (9 checks)          │
                          │       ↓ (retry loop on fail, max 3×)               │
@@ -370,13 +371,22 @@ Agentic-CTI/
 
 ---
 
-## 🤖 Model
+## 🤖 Model & Provider Stack
 
-- **LLM:** Groq `meta-llama/llama-4-scout-17b-16e-instruct` — extraction, YARA-L generation, log synthesis
+The pipeline supports **4 LLM providers** with automatic fallback. Set `LLM_PROVIDER` in `.env` to force a specific one, or let the auto-detection pick based on which keys are present.
+
+| Priority | Provider | Model | Notes |
+|---|---|---|---|
+| 1 | **Gemini** (current default) | `gemini-3.5-flash` | 20 RPD free tier — auto-falls back to `GEMINI_FALLBACK_MODEL` on daily quota |
+| 1a | **Gemini fallback** | `gemini-3.5-flash-lite` | Separate daily quota from primary; set via `GEMINI_FALLBACK_MODEL` |
+| 2 | **OpenRouter** | `google/gemini-2.5-flash:free` | Triggered automatically when Gemini daily quota exhausted |
+| 3 | **Cerebras** | `openai/gpt-oss-120b` | 1M tokens/day free tier, 128k context |
+| 4 | **Groq** | `openai/gpt-oss-120b` | 3-key pool with round-robin rotation on 429 |
+
 - **Embeddings:** `all-MiniLM-L6-v2` (sentence-transformers, local, no API key)
 - **Vector DB:** Qdrant (cosine similarity, persistent local volume)
 - **Log DB:** Elasticsearch 8.13 (single-node for dev, cluster-ready for prod)
-- **API key pool:** Up to 3 Groq accounts (`GROQ_API_KEY`, `GROQ_API_KEY_2`, `GROQ_API_KEY_3`); rotated on 429 via sticky round-robin before Retry-After sleep
+- **Gemini fallback chain:** `gemini-3.5-flash` → `gemini-3.5-flash-lite` → OpenRouter (automatic, no code change needed)
 
 ---
 
