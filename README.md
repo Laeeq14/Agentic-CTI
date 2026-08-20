@@ -375,13 +375,13 @@ Agentic-CTI/
 
 The pipeline supports **4 LLM providers** with automatic fallback. Set `LLM_PROVIDER` in `.env` to force a specific one, or let the auto-detection pick based on which keys are present.
 
-| Priority | Provider | Model | Notes |
-|---|---|---|---|
-| 1 | **Gemini** (current default) | `gemini-3.5-flash` | 20 RPD free tier — auto-falls back to `GEMINI_FALLBACK_MODEL` on daily quota |
-| 1a | **Gemini fallback** | `gemini-3.5-flash-lite` | Separate daily quota from primary; set via `GEMINI_FALLBACK_MODEL` |
-| 2 | **OpenRouter** | `google/gemini-2.5-flash:free` | Triggered automatically when Gemini daily quota exhausted |
-| 3 | **Cerebras** | `openai/gpt-oss-120b` | 1M tokens/day free tier, 128k context |
-| 4 | **Groq** | `openai/gpt-oss-120b` | 3-key pool with round-robin rotation on 429 |
+| Priority | Provider | Model | RPD | Notes |
+|---|---|---|---|---|
+| 1 | **Gemini** (current default) | `gemini-3.5-flash-lite` | **500** | High-capacity free tier — primary for benchmark runs |
+| 1a | **Gemini fallback** | `gemini-3.5-flash` | 20 | Higher quality; activates when flash-lite quota exhausted |
+| 2 | **OpenRouter** | `google/gemini-2.5-flash:free` | — | Auto-triggered on Gemini RESOURCE_EXHAUSTED daily quota |
+| 3 | **Cerebras** | `openai/gpt-oss-120b` | ~1M tokens/day | 128k context, fast inference |
+| 4 | **Groq** | `openai/gpt-oss-120b` | — | 3-key pool with round-robin rotation on 429 |
 
 - **Embeddings:** `all-MiniLM-L6-v2` (sentence-transformers, local, no API key)
 - **Vector DB:** Qdrant (cosine similarity, persistent local volume)
