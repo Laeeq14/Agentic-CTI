@@ -332,7 +332,8 @@ Agentic-CTI/
 +-- vector_store.py             # Qdrant wrapper — embed, store, RAG search
 |
 +-- api/
-|   +-- main.py                 # FastAPI — /analyze, /query-logs, /navigator-layer, /formats
+|   +-- main.py                 # FastAPI — /analyze, /query-logs, /navigator-layer, /formats, /graphql
+|   +-- graphql_schema.py       # Strawberry GraphQL schema — Query + Mutation types
 |   +-- es_client.py            # Elasticsearch client — search_logs(), get_index_stats()
 |   +-- Dockerfile              # Multi-stage build for FastAPI service
 |
@@ -387,6 +388,82 @@ The pipeline supports **4 LLM providers** with automatic fallback. Set `LLM_PROV
 - **Vector DB:** Qdrant (cosine similarity, persistent local volume)
 - **Log DB:** Elasticsearch 8.13 (single-node for dev, cluster-ready for prod)
 - **Gemini fallback chain:** `gemini-3.5-flash` → `gemini-3.5-flash-lite` → OpenRouter (automatic, no code change needed)
+
+---
+
+## 🔷 GraphQL API
+
+A [Strawberry](https://strawberry.rocks/) GraphQL endpoint is mounted **alongside** all REST routes at:
+
+```
+http://localhost:8000/graphql
+```
+
+Open that URL in a browser to get the **GraphiQL interactive playground** — no extra tooling needed.
+
+### Why GraphQL here?
+
+The pipeline returns a large, nested payload (IOCs, TTPs, three rule formats, retry metadata). GraphQL lets a consumer **select only the fields it needs** in a single round-trip instead of receiving the full response or making multiple REST calls.
+
+### Example: fetch only IOCs + YARA-L rule
+
+```graphql
+mutation AnalyzeAPT41 {
+  analyzeReport(
+    text: "APT41 deployed KEYPLUG via spear-phishing. C2: 203.0.113.45, backup.evil-apt41.com. TTPs: T1566.001, T1059.001."
+  ) {
+    threatActor
+    mitreTtps
+    iocs {
+      ips
+      domains
+      hashes
+    }
+    yaralRule
+    pipelineError
+  }
+}
+```
+
+### Example: query Elasticsearch logs
+
+```graphql
+mutation LogQuery {
+  queryLogs(
+    query: "event_type:NETWORK_CONNECTION AND dest_ip:185.220.101.47"
+    index: "agentic-cti-logs"
+    size: 50
+  ) {
+    threatActor
+    mitreTtps
+    sigmaRule
+    kqlQuery
+    retryCount
+  }
+}
+```
+
+### Example: generate ATT&CK Navigator layer
+
+```graphql
+mutation NavLayer {
+  navigatorLayer(ttps: ["T1059.001", "T1071.001", "T1041", "T1078"]) {
+    ttpCount
+    totalObservations
+    layerJson
+  }
+}
+```
+
+### Available operations
+
+| Operation | Type | Description |
+|---|---|---|
+| `health` | Query | Liveness probe |
+| `indexStats(index)` | Query | Elasticsearch index doc count + time range |
+| `analyzeReport(text)` | Mutation | Text threat report → threat intel + all rule formats |
+| `queryLogs(query, index, size)` | Mutation | ES Lucene query → threat intel + all rule formats |
+| `navigatorLayer(ttps, name, description)` | Mutation | TTP list → ATT&CK Navigator v4.9 layer JSON |
 
 ---
 

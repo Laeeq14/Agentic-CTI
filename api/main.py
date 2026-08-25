@@ -58,7 +58,7 @@ app = FastAPI(
         "Accepts raw threat reports or Elasticsearch log queries and returns extracted "
         "threat intel, RAG context, and validated detection rules in three formats: "
         "YARA-L 2.0 (Google SecOps), Sigma (SIEM-agnostic), and KQL (Microsoft Sentinel). "
-        "Also provides MITRE ATT\u0026CK Navigator layer export."
+        "Also provides MITRE ATT&CK Navigator layer export and a GraphQL API at /graphql."
     ),
     version="2.0.0",
     docs_url="/api/docs",
@@ -87,6 +87,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info("CORS origins configured: %s", _cors_origins)
+
+# ---------------------------------------------------------------------------
+# GraphQL — Strawberry router mounted at /graphql
+# ---------------------------------------------------------------------------
+# All existing /api/* REST endpoints are unaffected.
+# The api_key_middleware above already covers /graphql requests.
+# Interactive playground (GraphiQL) is available at http://localhost:8000/graphql
+# ---------------------------------------------------------------------------
+from api.graphql_schema import graphql_router  # noqa: E402
+app.include_router(graphql_router, prefix="/graphql")
+logger.info("GraphQL endpoint mounted at /graphql (GraphiQL playground enabled)")
 
 
 # ---------------------------------------------------------------------------
