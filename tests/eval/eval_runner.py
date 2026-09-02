@@ -65,13 +65,48 @@ from dotenv import load_dotenv
 
 load_dotenv(_REPO_ROOT / ".env")
 
-from tests.eval.fixtures import FIXTURES
+def _load_fixtures() -> list[dict]:
+    """
+    Load eval fixtures from the version-controlled JSON dataset.
+
+    Primary source: tests/data/eval_fixtures_v1.json
+      - Each fixture includes benchmark_model, benchmark_provider, and benchmark_date
+        provenance fields so results are self-describing.
+      - This is the authoritative ground-truth dataset; it is the source of the
+        98.8% IOC F1 and 0.0% FP rate headline metrics.
+
+    Fallback: tests/eval/fixtures.py (Python module, legacy)
+      - Used automatically if the JSON file is not found (e.g. during development
+        before the dataset has been generated). A warning is logged.
+    """
+    json_path = _REPO_ROOT / "tests" / "data" / "eval_fixtures_v1.json"
+    if json_path.exists():
+        import json as _json
+        with json_path.open(encoding="utf-8") as fh:
+            fixtures = _json.load(fh)
+        logging.getLogger(__name__).info(
+            "[fixtures] Loaded %d fixtures from %s (benchmark_model=%s, date=%s)",
+            len(fixtures),
+            json_path.name,
+            fixtures[0].get("benchmark_model", "unknown") if fixtures else "N/A",
+            fixtures[0].get("benchmark_date", "unknown") if fixtures else "N/A",
+        )
+        return fixtures
+    # Fallback to legacy Python module
+    logging.getLogger(__name__).warning(
+        "[fixtures] JSON dataset not found at %s — falling back to fixtures.py. "
+        "Run: py -c \"from tests.eval.fixtures import FIXTURES; import json, pathlib; "
+        "pathlib.Path('tests/data/eval_fixtures_v1.json').write_text(json.dumps(FIXTURES, indent=2))\"",
+        json_path,
+    )
+    from tests.eval.fixtures import FIXTURES as _PY_FIXTURES  # noqa: PLC0415
+    return _PY_FIXTURES
+
+
+FIXTURES = _load_fixtures()
 
 # Support the EVAL_FIXTURES alias used by deepeval_suite and other consumers
-try:
-    from tests.eval.fixtures import EVAL_FIXTURES  # noqa: F401
-except ImportError:
-    pass  # EVAL_FIXTURES may not be exported by older versions of fixtures.py
+EVAL_FIXTURES = FIXTURES
 
 from src.security.prompt_guard import scan as guard_scan
 

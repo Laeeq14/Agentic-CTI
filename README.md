@@ -1,5 +1,7 @@
 # Agentic-CTI 🛡️
 
+[![Eval Gate](https://github.com/Laeeq14/Agentic-CTI/actions/workflows/eval_gate.yml/badge.svg)](https://github.com/Laeeq14/Agentic-CTI/actions/workflows/eval_gate.yml)
+
 **A fully containerized, agentic threat triage engine powered by LangGraph, Elasticsearch, and a multi-provider LLM stack (Gemini → OpenRouter → Groq → Cerebras).**
 
 This is not an LLM wrapper. It is an end-to-end SOC automation platform that accepts raw threat advisories *and* live Elasticsearch log streams, and converts both into validated detection rules in three formats — YARA-L 2.0 (Google SecOps), Sigma (SIEM-agnostic), and KQL (Microsoft Sentinel) — with a quantifiable extraction F1 score across a 30-fixture benchmark suite, false-positive rate measurement against a 125-event benign traffic dataset, per-run latency and cost tracking, and a MITRE ATT&CK Navigator layer export.
@@ -10,6 +12,8 @@ This is not an LLM wrapper. It is an end-to-end SOC automation platform that acc
 
 *Verified 2026-07-08 · Groq `meta-llama/llama-4-scout-17b-16e-instruct` · 30 fixtures across 3 tiers (Tier 1: baselines, Tier 2: APT groups, Tier 3: edge cases)*
 > ⚠️ Benchmark was run on `llama-4-scout-17b-16e-instruct` (Groq). Current active provider is **Gemini `gemini-3.5-flash`** — re-run in progress.
+
+> 📖 **Methodology:** See [EVALUATION.md](./EVALUATION.md) for a full explanation of the two evaluation systems, fixture dataset schema, CI/CD gate thresholds, and how to reproduce these results.
 
 | Metric | Score |
 |---|---|
