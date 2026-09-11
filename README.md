@@ -54,6 +54,7 @@ This is not an LLM wrapper. It is an end-to-end SOC automation platform that acc
 | **Triple rule output** | Generates YARA-L 2.0 (Google SecOps), Sigma (SIEM-agnostic), and KQL (Microsoft Sentinel) from a single analysis pass |
 | **Parallel generation** | Sigma and KQL fan out from RAG simultaneously (LangGraph parallel branches on separate OS threads), then join before YARA-L — ~2× faster than sequential |
 | **Rate-limit resilience** | Three-account Groq API key pool; on a 429 the pipeline rotates to the next account immediately (no sleep) before falling back to Retry-After-based backoff with ±2s jitter. Thread-safe writes guarded by `threading.Lock` — parallel branches cannot produce lost-update corruption on the shared key index |
+| **RAG deduplication** | Two-layer guard in `vector_store.py`: (1) SHA-256 content hash → deterministic Qdrant point ID so re-running the same report always overwrites rather than duplicates; (2) cosine-similarity check (≥ 0.97) blocks near-duplicate ingestion when source text varies slightly across model runs |
 | **FP rate measurement** | Rules checked against a 125-event benign traffic dataset; rules exceeding 5% FP rate are flagged `needs_review` before the analyst sees them |
 | **Navigator export** | `/api/navigator-layer` endpoint emits ATT&CK Navigator v4.9 layers with frequency-proportional color gradients |
 | **CI/CD regression gate** | GitHub Actions workflow runs dry-run eval on every PR; live subset with IOC F1 ≥ 90% and Guard TPR = 100% thresholds on `run-live-eval` label — guards against silent LLM regression |
@@ -63,6 +64,7 @@ This is not an LLM wrapper. It is an end-to-end SOC automation platform that acc
 | **Quantified accuracy** | 30-fixture eval suite measuring IOC F1, TTP Recall, Sigma/KQL first-pass rate, FP rate (all 3 formats), latency, and cost |
 | **Prompt injection hardened** | 7-category regex guard runs in < 1ms before every LLM call |
 | **Zero-hallucination validator** | 9-check YARA-L structural validator with automatic LLM retry loop (up to 3 attempts) |
+| **Modular pipeline** | `agent.py` refactored into `src/pipeline/` (nodes, graph, runner), `src/llm/` (factory, rate-limit), and `src/models/` (schemas). `agent.py` is now a 65-line backwards-compat shim — all callers unchanged |
 
 ---
 
@@ -77,7 +79,7 @@ This is not an LLM wrapper. It is an end-to-end SOC automation platform that acc
                          └──────────┬──────────────────┘
                                     │
                          ┌──────────▼───────────────────────────────────────────┐
-                         │          LangGraph State Machine (agent.py)         │
+                          │     LangGraph State Machine (src/pipeline/graph.py)  │
                          │                                                     │
                          │  [Node 0] Prompt Injection Guard                    │
                          │       ↓                                             │
@@ -328,12 +330,12 @@ Agentic-CTI/
 |   +-- workflows/
 |       +-- eval_gate.yml       # CI/CD: dry-run on every PR; live regression gate on label
 |
-+-- agent.py                    # LangGraph pipeline — all nodes + graph topology
++-- agent.py                    # Backwards-compat shim — re-exports run_pipeline, ThreatIntelReport
 +-- app.py                      # Streamlit SOC dashboard
 +-- prompts.py                  # All LLM system/user prompts (extraction, YARA-L, Sigma, KQL)
 +-- validator.py                # YARA-L 2.0 structural validator (9 checks, retry feedback)
 +-- sigma_validator.py          # Sigma YAML structural validator (6 checks)
-+-- vector_store.py             # Qdrant wrapper — embed, store, RAG search
++-- vector_store.py             # Qdrant wrapper — embed, store, two-layer dedup, RAG search
 |
 +-- api/
 |   +-- main.py                 # FastAPI — /analyze, /query-logs, /navigator-layer, /formats, /graphql
@@ -348,6 +350,25 @@ Agentic-CTI/
 |       +-- benign_traffic.json # 125-event benign dataset for FP rate evaluation
 |
 +-- src/
+|   +-- models/
+|   |   +-- schemas.py          # Pydantic models: IOCBundle, ThreatIntelReport, ThreatIntelState
+|   +-- llm/
+|   |   +-- factory.py          # LLM provider detection + instantiation (Gemini/OpenRouter/Groq/Cerebras)
+|   |   +-- rate_limit.py       # API key pool, Retry-After backoff, response helpers
+|   +-- pipeline/
+|   |   +-- constants.py        # MAX_RETRIES, MAX_SIGMA_RETRIES, MAX_INPUT_CHARS
+|   |   +-- graph.py            # LangGraph construction + compiled graph instance
+|   |   +-- routers.py          # Conditional edge router functions
+|   |   +-- runner.py           # run_pipeline(), run_pipeline_from_logs() — public entry points
+|   |   +-- nodes/
+|   |       +-- security.py     # Node 0: prompt injection guard
+|   |       +-- extract.py      # Node 1/1b: threat intel extraction + ES log synthesis
+|   |       +-- rag.py          # Node 2: Qdrant RAG contextualization
+|   |       +-- sigma.py        # Node 3a: Sigma rule generation
+|   |       +-- kql.py          # Node 3b: KQL query generation
+|   |       +-- yaral.py        # Node 3c/4: YARA-L generation + validation
+|   |       +-- es_query.py     # Node 0.5: Elasticsearch log query
+|   |       +-- finalize.py     # Node 5: pipeline finalisation
 |   +-- security/
 |   |   +-- prompt_guard.py     # 7-category prompt injection guard (<1ms, pre-LLM)
 |   +-- navigator/
