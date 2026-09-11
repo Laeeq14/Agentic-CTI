@@ -168,11 +168,14 @@ def add_report(report: "Any", source_text: str = "") -> str:
     """
     Embed and upsert a ThreatIntelReport into the Qdrant collection.
 
-    Uses a deterministic point ID derived from the SOURCE DOCUMENT hash (not the
-    extraction summary) so that re-running the same report does not create
-    duplicate entries — even when the LLM produces slightly different extractions
-    across runs (non-determinism). Qdrant's upsert semantics overwrite an existing
-    point when the ID already exists.
+    Deduplication — two layers:
+      1. Content-hash upsert: a deterministic UUID derived from the source
+         document's SHA-256 hash means re-running the *same* raw text always
+         overwrites the existing point rather than creating a duplicate.
+      2. Cosine-similarity guard: if source_text is empty (hash falls back
+         to the LLM summary, which varies across model runs), this checks
+         whether a semantically near-identical record already exists
+         (threshold: 0.97) and skips ingestion if so.
 
     Args:
         report: A ThreatIntelReport Pydantic model instance.
@@ -180,7 +183,8 @@ def add_report(report: "Any", source_text: str = "") -> str:
                      primary deduplication key when provided.
 
     Returns:
-        The UUID string of the upserted point.
+        The UUID string of the upserted point, or an empty string if the
+        report was skipped as a near-duplicate.
     """
     initialize_collection()
     encoder = _get_encoder()
@@ -189,6 +193,29 @@ def add_report(report: "Any", source_text: str = "") -> str:
     summary = _build_report_summary(report)
     vector = encoder.encode(summary, normalize_embeddings=True).tolist()
 
+    # ── Layer 2: cosine-similarity guard (belt-and-suspenders) ──────────────
+    # Protects against duplicates when source_text is absent and the hash
+    # falls back to the extraction summary (which differs slightly per model).
+    collection_info = client.get_collection(COLLECTION_NAME)
+    if (collection_info.points_count or 0) > 0:
+        top_hits = client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=vector,
+            limit=1,
+            with_payload=False,
+        ).points
+        if top_hits and top_hits[0].score >= 0.97:
+            logger.info(
+                "[VectorStore] Skipping ingestion — near-duplicate already exists "
+                "(cosine_similarity=%.4f, actor=%s). "
+                "This is normal when the same report is run through multiple models.",
+                top_hits[0].score,
+                report.threat_actor,
+            )
+            return ""
+    # ── End guard ────────────────────────────────────────────────────────────
+
+    # ── Layer 1: content-hash upsert ─────────────────────────────────────────
     # Dedup key: prefer source document hash (stable across LLM runs),
     # fall back to extraction summary hash if no source text was provided.
     dedup_input = source_text.strip() if source_text and source_text.strip() else summary
@@ -212,6 +239,7 @@ def add_report(report: "Any", source_text: str = "") -> str:
         "Upserted report for threat actor '%s' (id=%s)", report.threat_actor, point_id
     )
     return point_id
+
 
 
 # ---------------------------------------------------------------------------
